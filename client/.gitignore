@@ -32,6 +32,9 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...but the example must be committed: the setup instructions copy it, and
+# without this negation a fresh clone has no file to copy.
+!.env.local.example
 
 # vercel
 .vercel

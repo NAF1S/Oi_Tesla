@@ -1,0 +1,238 @@
+---
+title: TeslaB — database (ERD)
+---
+%% TeslaB database schema. 21 application tables, generated from the live schema.
+%% Only the keys and the columns that carry meaning in the domain are shown;
+%% migration files under server/db/ are the source of truth.
+erDiagram
+    USERS {
+        uuid id PK
+        text name
+        text email UK
+        enum role
+        boolean active
+        text password_hash
+    }
+    PASSENGER_PROFILES {
+        uuid id PK
+        uuid user_id FK
+    }
+    DRIVER_PROFILES {
+        uuid id PK
+        uuid user_id FK
+        enum status
+        uuid current_service_point_id FK
+        uuid active_vehicle_id FK
+        timestamptz last_seen_at
+    }
+    VEHICLES {
+        uuid id PK
+        uuid driver_id FK
+        text name
+        integer seat_capacity
+        boolean active
+    }
+    SERVICE_ZONES {
+        uuid id PK
+        text code
+        text name
+        boolean active
+    }
+    SERVICE_POINTS {
+        uuid id PK
+        uuid zone_id FK
+        uuid routing_vertex_id FK
+        text code
+        text name
+        geography location
+    }
+    ROUTING_VERTICES {
+        uuid id PK
+        bigint graph_node_id
+        text code
+        geography location
+    }
+    ROUTING_EDGES {
+        uuid id PK
+        bigint graph_edge_id
+        uuid source_vertex_id FK
+        uuid target_vertex_id FK
+        integer distance_meters
+        integer normal_duration_seconds
+        integer rush_hour_duration_seconds
+        boolean bidirectional
+    }
+    FARE_POLICIES {
+        uuid id PK
+        text code
+        integer version
+        numeric base_fare
+        numeric per_kilometer_rate
+        numeric per_minute_rate
+        numeric minimum_fare
+        numeric fare_rounding_unit
+        timestamptz effective_from
+        timestamptz effective_to
+    }
+    FARE_QUOTES {
+        uuid id PK
+        uuid passenger_profile_id FK
+        uuid fare_policy_id FK
+        uuid origin_service_point_id FK
+        uuid destination_service_point_id FK
+        integer distance_meters
+        integer duration_seconds
+        numeric final_fare
+        numeric fare_rounding_adjustment
+        timestamptz expires_at
+    }
+    RIDE_REQUESTS {
+        uuid id PK
+        uuid passenger_profile_id FK
+        uuid fare_quote_id FK "unique"
+        uuid pickup_service_point_id FK
+        uuid dropoff_service_point_id FK
+        enum status
+        timestamptz requested_at
+        timestamptz search_expires_at
+        timestamptz cancelled_at
+        enum cancellation_reason
+        text idempotency_key
+    }
+    RIDE_EVENTS {
+        uuid id PK
+        uuid ride_request_id FK
+        integer sequence
+        enum event_type
+        uuid actor_user_id FK
+        enum previous_status
+        enum new_status
+    }
+    DISPATCH_OFFERS {
+        uuid id PK
+        uuid ride_request_id FK
+        uuid driver_profile_id FK
+        uuid vehicle_id FK
+        uuid ride_pool_id FK
+        enum offer_type
+        enum status
+        timestamptz expires_at
+        jsonb proposal_snapshot
+    }
+    RIDE_POOLS {
+        uuid id PK
+        uuid driver_profile_id FK
+        uuid vehicle_id FK
+        enum status
+        integer capacity_snapshot
+        integer version
+        timestamptz departed_at
+        timestamptz completed_at
+    }
+    POOL_MEMBERS {
+        uuid id PK
+        uuid ride_pool_id FK
+        uuid ride_request_id FK "unique"
+        enum status
+        timestamptz picked_up_at
+        timestamptz dropped_off_at
+    }
+    POOL_STOPS {
+        uuid id PK
+        uuid ride_pool_id FK
+        uuid ride_request_id FK
+        uuid pool_member_id FK
+        uuid service_point_id FK
+        enum stop_type
+        integer sequence
+        enum status
+        timestamptz completed_at
+    }
+    POOL_EVENTS {
+        uuid id PK
+        uuid ride_pool_id FK
+        integer sequence
+        enum event_type
+        uuid actor_user_id FK
+    }
+    POOL_FARE_CALCULATIONS {
+        uuid id PK
+        uuid ride_pool_id FK
+        uuid pricing_policy_id FK
+        integer pool_version
+        enum status
+        text shared_fare_rule_version
+        numeric total_final_passenger_fare
+        numeric fare_rounding_unit
+        timestamptz finalized_at
+    }
+    POOL_FARE_LEGS {
+        uuid id PK
+        uuid fare_calculation_id FK
+        integer sequence
+        uuid from_pool_stop_id FK
+        uuid to_pool_stop_id FK
+        integer distance_meters
+        numeric total_leg_cost
+    }
+    PASSENGER_FARE_ALLOCATIONS {
+        uuid id PK
+        uuid fare_calculation_id FK
+        uuid pool_member_id FK
+        uuid ride_request_id FK
+        numeric accepted_solo_fare
+        numeric uncapped_pooled_fare
+        numeric final_fare
+        numeric fare_rounding_adjustment
+    }
+    PASSENGER_FARE_LEG_SHARES {
+        uuid id PK
+        uuid passenger_fare_allocation_id FK
+        uuid pool_fare_leg_id FK
+        integer onboard_passenger_count
+        numeric share_ratio
+        numeric allocated_amount
+    }
+
+    USERS ||--o| PASSENGER_PROFILES : "is a"
+    USERS ||--o| DRIVER_PROFILES : "is a"
+    DRIVER_PROFILES ||--o{ VEHICLES : "owns"
+    DRIVER_PROFILES |o--o| VEHICLES : "driving now"
+    SERVICE_POINTS |o--o{ DRIVER_PROFILES : "waiting at"
+    SERVICE_ZONES ||--o{ SERVICE_POINTS : "groups"
+    ROUTING_VERTICES ||--o{ SERVICE_POINTS : "anchors"
+    ROUTING_VERTICES ||--o{ ROUTING_EDGES : "leaves"
+    ROUTING_VERTICES ||--o{ ROUTING_EDGES : "arrives"
+    PASSENGER_PROFILES ||--o{ FARE_QUOTES : "asks for"
+    FARE_POLICIES ||--o{ FARE_QUOTES : "prices"
+    SERVICE_POINTS ||--o{ FARE_QUOTES : "from"
+    SERVICE_POINTS ||--o{ FARE_QUOTES : "to"
+    PASSENGER_PROFILES ||--o{ RIDE_REQUESTS : "requests"
+    FARE_QUOTES ||--o| RIDE_REQUESTS : "authorises"
+    SERVICE_POINTS ||--o{ RIDE_REQUESTS : "picks up at"
+    SERVICE_POINTS ||--o{ RIDE_REQUESTS : "drops off at"
+    RIDE_REQUESTS ||--o{ RIDE_EVENTS : "records"
+    USERS |o--o{ RIDE_EVENTS : "acted"
+    RIDE_REQUESTS ||--o{ DISPATCH_OFFERS : "offered as"
+    DRIVER_PROFILES ||--o{ DISPATCH_OFFERS : "receives"
+    VEHICLES ||--o{ DISPATCH_OFFERS : "with"
+    RIDE_POOLS |o--o{ DISPATCH_OFFERS : "join offer for"
+    DRIVER_PROFILES ||--o{ RIDE_POOLS : "drives"
+    VEHICLES ||--o{ RIDE_POOLS : "driven with"
+    RIDE_POOLS ||--o{ POOL_MEMBERS : "carries"
+    RIDE_REQUESTS ||--o| POOL_MEMBERS : "occupies"
+    RIDE_POOLS ||--o{ POOL_STOPS : "scheduled as"
+    POOL_MEMBERS ||--o{ POOL_STOPS : "serves"
+    RIDE_REQUESTS ||--o{ POOL_STOPS : "stop for"
+    SERVICE_POINTS ||--o{ POOL_STOPS : "located at"
+    RIDE_POOLS ||--o{ POOL_EVENTS : "records"
+    USERS |o--o{ POOL_EVENTS : "acted"
+    RIDE_POOLS ||--o{ POOL_FARE_CALCULATIONS : "settles"
+    FARE_POLICIES ||--o{ POOL_FARE_CALCULATIONS : "prices"
+    POOL_FARE_CALCULATIONS ||--o{ POOL_FARE_LEGS : "measured as"
+    POOL_STOPS ||--o{ POOL_FARE_LEGS : "bounds"
+    POOL_FARE_CALCULATIONS ||--o{ PASSENGER_FARE_ALLOCATIONS : "split into"
+    POOL_MEMBERS ||--o| PASSENGER_FARE_ALLOCATIONS : "is billed"
+    RIDE_REQUESTS ||--o{ PASSENGER_FARE_ALLOCATIONS : "billed for"
+    PASSENGER_FARE_ALLOCATIONS ||--o{ PASSENGER_FARE_LEG_SHARES : "itemised as"
+    POOL_FARE_LEGS ||--o{ PASSENGER_FARE_LEG_SHARES : "shared as"

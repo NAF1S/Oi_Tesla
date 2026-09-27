@@ -1,0 +1,68 @@
+---
+title: TeslaB — system architecture
+---
+%% TeslaB: a ride-pooling demo.
+%% Read top to bottom: who uses it, the web app, the API, the database.
+%% Everything the API answers is computed on the server; the client only renders it.
+flowchart TB
+    subgraph actors["Who uses it"]
+        direction LR
+        pax(["Passenger"])
+        drv(["Driver"])
+    end
+
+    subgraph web["Next.js 16 client &middot; localhost:3000"]
+        direction TB
+        screens["App Router screens<br/>/ &nbsp; /signin &nbsp; /signup &nbsp; /status<br/>/ride &nbsp; /track &nbsp; /driver"]
+        guards["Server-side guards<br/>lib/session.js"]
+        widgets["Client components<br/>poll for state changes"]
+        apiClient["lib/api.js<br/>one fetch wrapper"]
+    end
+
+    subgraph api["Express 5 API &middot; localhost:4000"]
+        direction TB
+        middleware["Middleware<br/>cors &middot; json &middot; cookies<br/>requireAuth &middot; requireRole"]
+        routeMods["10 route modules under /api"]
+        controllers["Controllers"]
+        services["Services &mdash; the domain"]
+        pure["Pure rules modules (unit tested)<br/>ride.status &middot; dispatch &middot; matching<br/>pool.fare &middot; trip"]
+        orm["Prisma + adapter-pg"]
+    end
+
+    subgraph data["PostgreSQL 17 &middot; PostGIS + pgRouting &middot; localhost:55432"]
+        direction TB
+        tables["21 tables<br/>CHECKs &middot; 25 triggers &middot; unique indexes"]
+        files["server/db/NN-*.sql<br/>idempotent migrations + seeds"]
+    end
+
+    contract["openapi.yaml<br/>the API contract, served at /api/docs"]
+    suite["node --test<br/>unit + integration suites"]
+
+    pax --> screens
+    drv --> screens
+    screens --> guards
+    guards --> widgets
+    widgets --> apiClient
+    apiClient -->|"HTTP /api/*<br/>HttpOnly cookie, never a token in JS"| middleware
+    middleware --> routeMods
+    routeMods --> controllers
+    controllers --> services
+    services --> pure
+    services --> orm
+    orm -->|"parameterised SQL"| tables
+    files -.->|"npm run db:migrate<br/>npm run db:seed"| tables
+    contract -.->|"checked against"| routeMods
+    suite -.->|"exercises"| services
+    suite -.->|"runs against"| tables
+
+    classDef place fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef app fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef domain fill:#dcfce7,stroke:#16a34a,color:#052e16
+    classDef store fill:#fef3c7,stroke:#d97706,color:#451a03
+    classDef side fill:#f4f4f5,stroke:#71717a,color:#27272a,stroke-dasharray:4 3
+
+    class pax,drv place
+    class screens,guards,widgets,apiClient,middleware,routeMods,controllers app
+    class services,pure,orm domain
+    class tables,files store
+    class contract,suite side
