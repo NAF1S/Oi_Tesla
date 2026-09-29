@@ -109,10 +109,31 @@ const CANDIDATE_POOLS_SQL = `
      AND v.active
      AND v.seat_capacity > 0
      AND driver_point.active
-     -- "The driver must be online on the starting point": the driver's own service
-     -- point is the corner this pool starts from, so they are already standing
-     -- there rather than being routed across town to reach it.
-     AND dp.current_service_point_id = $1::uuid
+     -- "The driver must be online on the starting point."
+     --
+     -- There are two ways to be there, and the second is the one that matters
+     -- while a ride is in progress. An *available* driver standing at a corner
+     -- reports that corner as their service point, so the first arm covers them.
+     -- A driver already committed to a ride reports the place their previous trip
+     -- ended -- current_service_point_id is where they last were, not where the
+     -- car is going -- so for them the honest question is where their plan
+     -- starts, and this pool's first stop is that corner by the check below.
+     --
+     -- Without the second arm, the console's promise -- "another passenger can
+     -- still be added to the car you are driving" -- could never come true. The
+     -- offer was unreachable for every driver who was actually on a ride, which
+     -- is the only kind of driver it was written for.
+     AND (
+           dp.current_service_point_id = $1::uuid
+           OR EXISTS (
+                 SELECT 1
+                   FROM pool_stops first_stop
+                  WHERE first_stop.ride_pool_id = rp.id
+                    AND first_stop.sequence = 1
+                    AND first_stop.stop_type = 'PICKUP'
+                    AND first_stop.service_point_id = $1::uuid
+              )
+         )
      AND EXISTS (SELECT 1 FROM pool_members pm WHERE pm.ride_pool_id = rp.id)
      -- And every member already aboard started from that same corner. Checked
      -- against the members' own requests rather than the pool's geometry, because

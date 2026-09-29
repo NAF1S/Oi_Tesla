@@ -1,17 +1,230 @@
+# ---------------------------------------------------------------------------
+# TeslaB: the database, the API, the client, and the jobs that have to run for
+# them to work.
+#
+#   cp .env.example .env          then set JWT_SECRET
+#   docker compose up -d --build  everything, in dependency order
+#   docker compose logs -f api    watch one of them
+#   docker compose down           stop (the database volume is kept)
+#   docker compose down -v        stop and delete the data
+#
+# ---------------------------------------------------------------------------
+# THE ORDER, AND WHY IT IS EXPRESSED RATHER THAN DOCUMENTED
+# ---------------------------------------------------------------------------
+#   db  ->  migrate  ->  seed  ->  api  ->  web
+#
+# `depends_on` with a condition is what enforces it. A plain `depends_on` only
+# waits for the container to *start*, which for a one-shot job is meaningless --
+# it would let the API come up against a database with no tables in it, and the
+# first request would fail with a confusing error instead of the stack refusing
+# to come up. `service_healthy` waits for the database to accept connections;
+# `service_completed_successfully` waits for a job to finish *and* exit zero.
+#
+# `migrate` and `seed` are one-shot containers, not part of the running stack.
+# They stay in the listing as `Exited (0)`, which is what success looks like.
+# ---------------------------------------------------------------------------
+# IF YOU ARE DEPLOYING TO A SMALL INSTANCE
+# ---------------------------------------------------------------------------
+# This file builds both images on the machine it runs on, and `next build` wants
+# well over 1 GB. On a 1 vCPU / 512 MB instance it will be OOM-killed. Build the
+# images somewhere with room -- another machine, or CI -- push them to a registry,
+# and on the instance run `docker compose up -d` with the `build:` sections
+# removed (or with `docker compose pull` first). See README.md.
+# ---------------------------------------------------------------------------
+
+# The connection string inside the compose network. Note `db:5432` -- the
+# *internal* port. The 55432 published on the host is only for psql from outside.
+x-database-url: &database-url >-
+  postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-TeslaB}
+
+# ---------------------------------------------------------------------------
+# THE TWO IMAGE RECIPES, WRITTEN HERE RATHER THAN IN Dockerfiles
+#
+# `dockerfile_inline` is what makes this file self-contained: there is no docker/
+# directory any more, and `docker compose build` reads the recipes below straight
+# out of this file. One file, two images.
+# ---------------------------------------------------------------------------
+
+# The database image.
+#
+# It is three lines because the only thing missing from the official image is
+# pgRouting. The plain `postgres` image has no PostGIS shared library, so
+# `CREATE EXTENSION postgis` would fail on it; upstream `postgis/postgis` has no
+# pgRouting, so `CREATE EXTENSION pgrouting` would fail on that one. This starts
+# from the PostGIS image of the PostgreSQL major version the project uses and
+# adds the one package it does not have.
+x-db-dockerfile: &db-dockerfile |
+  FROM postgis/postgis:17-3.5
+  RUN apt-get update \
+      && apt-get install -y --no-install-recommends postgresql-17-pgrouting \
+      && rm -rf /var/lib/apt/lists/*
+
+# The application image: the Express API and the Next.js client.
+#
+# One recipe with two targets, both used below.
+#
+#   api   the Express API -- and every one-shot job (`db:migrate`, `db:seed`, the
+#         dispatch sweep) is this same image with a different command, because
+#         they are the same code with the same dependencies.
+#   web   the Next.js client, with its production build baked in.
+#
+# The **build context is the repository root**, and that is not a preference.
+# This is an npm workspace: one lockfile, one hoisted node_modules, and Prisma's
+# generated client written to `<root>/node_modules/@prisma/client`. A context of
+# `server/` would have no lockfile to install from and nowhere to generate the
+# client into.
+#
+# `$${API_PROXY_TARGET}` is doubled on purpose. A single `$` is a *compose*
+# variable, and compose would substitute it before the recipe ever reached the
+# builder -- silently, with an empty string. The double `$$` is how a compose
+# file passes a literal `$` through to the thing it is describing.
+x-app-dockerfile: &app-dockerfile |
+  FROM node:22-bookworm-slim AS deps
+
+  WORKDIR /app
+
+  # openssl: the Prisma engines link against it, and `bookworm-slim` does not
+  # promise the version they were built for.
+  RUN apt-get update \
+   && apt-get install -y --no-install-recommends openssl ca-certificates \
+   && rm -rf /var/lib/apt/lists/*
+
+  # Only the manifests, so editing a source file does not reinstall the world.
+  COPY package.json package-lock.json ./
+  COPY client/package.json ./client/
+  COPY server/package.json ./server/
+  # `--ignore-scripts` because the server workspace's `postinstall` is
+  # `prisma generate`, and the schema is not here at this layer yet. Generating
+  # it explicitly in the api target also means a change to schema.prisma no
+  # longer invalidates the install layer.
+  RUN npm ci --ignore-scripts
+
+  # -------------------------------------------------------------------------
+  # api: the Express server, and the jobs that run its migrations and seeds.
+  # -------------------------------------------------------------------------
+  FROM deps AS api
+
+  WORKDIR /app
+
+  COPY server ./server
+
+  # Writes to /app/node_modules/@prisma/client, the hoisted location -- the same
+  # place `npm run db:generate` writes it locally.
+  RUN npm run db:generate --workspace server
+
+  ENV NODE_ENV=production
+  ENV PORT=4000
+
+  # The files stay owned by root, which costs nothing: everything the server
+  # reads is world-readable, and it writes nothing at run time. A `chown -R /app`
+  # here would instead copy the whole of node_modules into a new layer -- about a
+  # gigabyte and two minutes, for a permission the process does not use.
+  USER node
+
+  EXPOSE 4000
+  CMD ["node", "server/src/index.js"]
+
+  # -------------------------------------------------------------------------
+  # web: the Next.js client, built for production.
+  # -------------------------------------------------------------------------
+  FROM deps AS web
+
+  WORKDIR /app
+
+  COPY client ./client
+
+  # `next.config.mjs` reads this while the build collects the route manifest, so
+  # the /api rewrite is baked into the output -- setting it at run time has no
+  # effect on it.
+  ARG API_PROXY_TARGET=http://api:4000
+  ENV API_PROXY_TARGET=$${API_PROXY_TARGET}
+  RUN npm run build --workspace client
+
+  ENV NODE_ENV=production
+  ENV PORT=3000
+
+  # Next binds to 0.0.0.0 when HOSTNAME says so, and to localhost when it does
+  # not -- which, in a container, means nothing outside it can connect.
+  ENV HOSTNAME=0.0.0.0
+
+  # The one thing that has to be writable at run time: `next start` keeps a cache
+  # under .next. Chowning all of /app instead would duplicate node_modules into a
+  # second layer for no reason -- see the note in the api target.
+  RUN chown -R node:node /app/client/.next
+  USER node
+
+  EXPOSE 3000
+  CMD ["npm", "run", "start", "--workspace", "client"]
+
+# Everything the API and the jobs need. Merged into each service with `<<:`.
+x-app-environment: &app-environment
+  NODE_ENV: production
+  DATABASE_URL: *database-url
+  # The browser never calls the API cross-origin -- it calls the Next server,
+  # which proxies -- so this matters only for the dev server's CORS.
+  CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:3000}
+  # The server refuses to start with NODE_ENV=production without this, on
+  # purpose. There is no default: a signing key that has a fallback is a signing
+  # key an attacker knows.
+  #
+  # Copying .env.example is not enough on its own -- that file ships with the
+  # value deliberately empty. Generate one:
+  #
+  #   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+  #
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required; see .env.example for how to generate one}
+  AUTH_TOKEN_TTL_SECONDS: ${AUTH_TOKEN_TTL_SECONDS:-7200}
+  # ---------------------------------------------------------------------------
+  # FALSE, AND IT MATTERS.
+  #
+  # The API defaults COOKIE_SECURE to true when NODE_ENV=production, which is
+  # correct: a session cookie should only travel over TLS. But this stack, as
+  # written, serves plain HTTP on port 3000, and a Secure cookie is not sent
+  # over HTTP -- so signing in would appear to succeed and then every subsequent
+  # request would be anonymous.
+  #
+  # Set this to true the moment there is TLS in front of it, and make
+  # CLIENT_ORIGIN the https:// address.
+  # ---------------------------------------------------------------------------
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+
+# The api image's build. Every service that runs the API code -- the two one-shot
+# jobs, the server and the sweeper -- carries this same block rather than only
+# the `api` service owning it. Compose builds a service's image before it starts
+# that service, so a shared anchor means `docker compose up -d migrate` works on
+# its own instead of trying to pull `teslab/api` from a registry that has never
+# heard of it. BuildKit caches the layers, so the repeats cost nothing.
+x-api-build: &api-build
+  context: .
+  dockerfile_inline: *app-dockerfile
+  target: api
+
+# The client's build: the same recipe, the other target, plus the one argument
+# that has to be present while the route manifest is collected.
+x-web-build: &web-build
+  context: .
+  dockerfile_inline: *app-dockerfile
+  target: web
+  args:
+    API_PROXY_TARGET: http://api:4000
+
+x-db-build: &db-build
+  context: .
+  dockerfile_inline: *db-dockerfile
+
 services:
+  # -------------------------------------------------------------------------
+  # The database: PostgreSQL 17 + PostGIS 3.5 + pgRouting.
+  #
+  # Built from the `x-db-dockerfile` recipe above, which starts from the PostGIS
+  # image of the same PostgreSQL major version and adds
+  # `postgresql-17-pgrouting`. The plain `postgres` image has no PostGIS shared
+  # library, so `CREATE EXTENSION postgis` would fail on it; the upstream
+  # `postgis/postgis` image has no pgRouting, so `CREATE EXTENSION pgrouting`
+  # would fail on that one.
+  # -------------------------------------------------------------------------
   db:
-    # Built from docker/db/Dockerfile, which starts from the PostGIS 17-3.5 image
-    # of the same PostgreSQL major version -- so the existing teslab-pgdata
-    # volume keeps working -- and adds the `postgresql-17-pgrouting` package.
-    #
-    # The plain `postgres` image has no PostGIS shared library, so
-    # `CREATE EXTENSION postgis` would fail on it; the upstream
-    # `postgis/postgis` image has no pgRouting, so `CREATE EXTENSION pgrouting`
-    # would fail on that one. This image has both.
-    #
-    # Rebuild after a Dockerfile change with: docker compose up -d --build db
-    build:
-      context: ./docker/db
+    build: *db-build
     image: teslab/postgis-pgrouting:17-3.5
     container_name: teslab-db
     restart: unless-stopped
@@ -19,14 +232,38 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-TeslaB}
+    # Bound to 127.0.0.1, not published on every interface. The mapping exists so
+    # you can reach the database with psql from the host; on a cloud instance,
+    # `0.0.0.0:55432` would also mean anyone who can reach the machine can reach
+    # your database. Nothing in the stack needs this -- the other containers talk
+    # to `db:5432` over the compose network.
     ports:
-      # 55432 on the host: 5432 is taken by a local PostgreSQL service and 5433
-      # by another container. Override with POSTGRES_PORT in a root .env file.
-      - "${POSTGRES_PORT:-55432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    # Tuned down from the defaults, which assume a database that has the machine
+    # to itself. This one shares it with the API and two Next.js processes, and
+    # on a small instance the default 128 MB of shared_buffers is memory the
+    # other three are not using. Raise them if you give the stack more room.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-96MB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-4MB}
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-50}
     volumes:
+      # -----------------------------------------------------------------------
+      # NOT mounted at /docker-entrypoint-initdb.d, deliberately.
+      #
+      # An earlier version of this file mounted ./server/db there, which runs
+      # those SQL files only when the volume is *created*. That made the first
+      # startup succeed and every later schema change invisible -- the files are
+      # re-runnable and idempotent, but nothing was re-running them. The
+      # `migrate` service below applies them on every `up`, which is what the
+      # project's own `npm run db:migrate` does, and with the same error
+      # handling.
+      # -----------------------------------------------------------------------
       - teslab-pgdata:/var/lib/postgresql/data
-      # Files here run automatically the first time the volume is created.
-      - ./server/db:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-TeslaB}"]
       interval: 5s
@@ -34,5 +271,158 @@ services:
       retries: 10
       start_period: 5s
 
+  # -------------------------------------------------------------------------
+  # One-shot: apply server/db/*.sql.
+  #
+  # Idempotent and cumulative, so this is safe on every `up` -- it is a schema
+  # convergence, not a version bump. Adding a table means adding a file, and
+  # this job will apply it the next time the stack starts.
+  # -------------------------------------------------------------------------
+  migrate:
+    build: *api-build
+    image: teslab/api
+    container_name: teslab-migrate
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *app-environment
+    command: ["npm", "run", "db:migrate", "--workspace", "server"]
+
+  # -------------------------------------------------------------------------
+  # One-shot: the demo data -- accounts, service points, the routing graph and
+  # the pricing policy.
+  #
+  # Without this the database is structurally correct and completely empty: no
+  # ServicePoints means no route to price, which means no ride can be requested.
+  #
+  # NODE_ENV=production makes the seeder refuse demo accounts unless it is told
+  # otherwise, and that guard is worth keeping. `ALLOW_DEMO_SEED` is what tells
+  # it. Remove this whole service for a deployment that should not carry the
+  # demo cast, and note that `api` waits for it -- so if you remove it, remove
+  # the `depends_on` below too.
+  # -------------------------------------------------------------------------
+  seed:
+    build: *api-build
+    image: teslab/api
+    container_name: teslab-seed
+    restart: "no"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-environment
+      ALLOW_DEMO_SEED: "true"
+      DEMO_SEED_PASSWORD: ${DEMO_SEED_PASSWORD:-DemoPass123!}
+    command: ["npm", "run", "db:seed", "--workspace", "server"]
+
+  # -------------------------------------------------------------------------
+  # The API.
+  #
+  # This is the service that owns the `build:` block for the api image; the
+  # three jobs above and the sweeper below reuse the same tag, so compose builds
+  # it once rather than four times.
+  # -------------------------------------------------------------------------
+  api:
+    build: *api-build
+    image: teslab/api
+    container_name: teslab-api
+    restart: unless-stopped
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-environment
+      PORT: "4000"
+      BCRYPT_COST: ${BCRYPT_COST:-10}
+    # No published port. Nothing outside the stack should reach the API
+    # directly: the browser goes through the Next server, which is what keeps
+    # the session cookie same-origin. Uncomment to poke at it from the host.
+    # ports:
+    #   - "127.0.0.1:4000:4000"
+    healthcheck:
+      # The slim image has no curl and no wget, so the probe is node itself --
+      # which is present by definition, and speaks HTTP without a dependency.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # -------------------------------------------------------------------------
+  # The client.
+  # -------------------------------------------------------------------------
+  web:
+    build: *web-build
+    image: teslab/web
+    container_name: teslab-web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+      # Server Components and the session guard call the API directly, so this
+      # one *is* read at run time. Inside the network, by service name.
+      API_URL: http://api:4000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # The background jobs that keep dispatch moving.
+  #
+  # This is not optional decoration. A ride request that finds no free driver is
+  # left WAITING with nothing scheduled to look again, and an offer that nobody
+  # answers stays pending until something sweeps it. `retryWaitingRequests` is
+  # the safety net for the whole dispatch design -- and until this service
+  # existed, it only ran when a human typed `npm run dispatch:sweep`. A request
+  # that missed its window stayed missed.
+  #
+  # Both commands are idempotent and cheap; the loop is a fixed interval rather
+  # than a scheduler because a demo does not need cron and an interval cannot
+  # drift out of sync with the schema.
+  # -------------------------------------------------------------------------
+  sweeper:
+    build: *api-build
+    image: teslab/api
+    container_name: teslab-sweeper
+    restart: unless-stopped
+    working_dir: /app/server
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-environment
+    command:
+      - sh
+      - -c
+      - |
+        while true; do
+          node src/commands/expire-ride-requests.js || true
+          node src/commands/dispatch-sweep.js || true
+          sleep ${SWEEP_INTERVAL_SECONDS:-30}
+        done
+
 volumes:
+  # Named `teslab-pgdata` and left unprefixed by a project `name:`, so the volume
+  # an existing checkout already has keeps being found. Adding `name:` to this
+  # file would rename the project and orphan the data.
   teslab-pgdata:
+

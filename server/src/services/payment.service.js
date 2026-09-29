@@ -309,7 +309,26 @@ export const loadWalletForUser = async ({ userId }) => {
   return wallet;
 };
 
-/** The most recent movements on a user's wallet, newest first. */
+/**
+ * The most recent movements on a user's wallet, newest first.
+ *
+ * Both joins onto `payments` are LEFT joins, and that is the point of the query
+ * rather than a detail of it. An entry can have no payment for two reasons: a
+ * TOP_UP never has one, and a PAYMENT entry loses the reference when the payment
+ * it recorded is deleted -- `wallet_ledger_payment_fkey` is ON DELETE SET NULL
+ * precisely so the entry outlives the ride that produced it.
+ *
+ * An inner join drops both. That is how a wallet came to report a balance of
+ * 10,500.00 with a ledger that appeared to contain one -90.00 debit: 31 rows in
+ * the table, one in the answer.
+ *
+ * `counterpartName` is null for those rows and the DTO passes that through
+ * rather than inventing a name -- with no payment there is no counterparty.
+ *
+ * The list is capped, so it is "recent movements", not a statement that adds up
+ * to the balance. The balance is the database's own column, reconciled against
+ * this table by a deferred constraint.
+ */
 export const listWalletLedger = async ({ userId, limit = 20 }) => {
   const rows = await prisma.$queryRawUnsafe(
     `SELECT l.id, l.direction, l.amount::text AS amount, l.balance_after::text AS balance_after,
@@ -317,8 +336,8 @@ export const listWalletLedger = async ({ userId, limit = 20 }) => {
             counterpart.name AS counterpart_name
        FROM wallet_ledger l
        JOIN wallet_accounts w ON w.id = l.account_id
-       JOIN payments p ON p.id = l.payment_id
-       JOIN users counterpart
+       LEFT JOIN payments p ON p.id = l.payment_id
+       LEFT JOIN users counterpart
          ON counterpart.id = CASE WHEN l.direction = 'DEBIT' THEN p.driver_user_id ELSE p.payer_user_id END
       WHERE w.user_id = $1::uuid
       ORDER BY l.created_at DESC, l.id DESC

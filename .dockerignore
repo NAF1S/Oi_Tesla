@@ -1,0 +1,44 @@
+# What the application image must not carry.
+#
+# The build context is the repository root, so without this file every build
+# would upload node_modules, the client's build output and the git history to
+# the daemon -- hundreds of megabytes per build, for files the image rebuilds or
+# does not use at all.
+
+# Reinstalled in the image from the lockfile, so what is on the host is
+# irrelevant -- and a Windows or macOS node_modules is not just useless here, it
+# is wrong (native binaries for the wrong platform).
+node_modules
+**/node_modules
+
+# `next build` runs inside the image.
+client/.next
+client/out
+
+# Real secrets. No image should contain one, and `.env.local` is where the
+# client keeps a developer's.
+.env
+.env.*
+!.env.example
+**/.env.local
+!**/.env.local.example
+
+# The database image's recipe now lives in docker-compose.yml, so this context
+# has no docker/ directory to exclude.
+
+# Nothing in an image reads these.
+.git
+.gitignore
+.github
+.vscode
+docs
+
+# The suites need a live database and are never run from the image. If you want
+# `docker compose run --rm api npm test`, delete the next two lines.
+**/test
+**/tests
+
+# Editor and OS noise.
+*.log
+.DS_Store
+Thumbs.db
