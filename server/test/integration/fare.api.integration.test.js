@@ -825,7 +825,7 @@ describe('phase boundary', () => {
     assert.strictEqual(collection.status, 404);
   });
 
-  it('introduces no shared, seated or payment table', async () => {
+  it('introduces no shared or seated table', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -833,10 +833,15 @@ describe('phase boundary', () => {
         ORDER BY table_name`,
     );
 
+    // The TeslaPay milestone added the three wallet tables, so the snapshot now
+    // carries them. What this phase still refuses is anything *shared* (a seat
+    // count, a pooled fare, an assignment): `pool_*` and `payments` are the
+    // per-passenger records this milestone's pricing produced, not a shared ride.
     assert.deepStrictEqual(
       rows.map((row) => row.table_name),
       [
         'dispatch_offers',
+        'payments',
         'pool_events',
         'pool_fare_calculations',
         'pool_fare_legs',
@@ -845,8 +850,10 @@ describe('phase boundary', () => {
         'ride_events',
         'ride_pools',
         'ride_requests',
+        'wallet_accounts',
+        'wallet_ledger',
       ],
-      'pricing, ride, pool and shared-fare tables exist; nothing shared, seated or paid does',
+      'pricing, ride, pool, shared-fare and wallet tables exist; nothing seated does',
     );
   });
 

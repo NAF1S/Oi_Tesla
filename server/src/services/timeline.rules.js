@@ -185,6 +185,13 @@ export const TIMELINE = Object.freeze({
     phase: END,
     labels: { [PASSENGER]: 'Ride completed' },
   },
+  // TeslaPay. Without this entry the event would be written and then hidden:
+  // an event type that is not in this map is invisible to everybody.
+  RIDE_PAID: {
+    audiences: [PASSENGER],
+    phase: END,
+    labels: { [PASSENGER]: 'Ride paid' },
+  },
 
   // --- The driver's own pool -----------------------------------------------
   POOL_CREATED: {

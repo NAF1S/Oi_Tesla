@@ -242,6 +242,17 @@ export const env = {
      */
     transactionTimeoutMs: toNumber(process.env.TRIP_TRANSACTION_TIMEOUT_MS, 10_000),
   },
+
+  // --- TeslaPay ----------------------------------------------------------
+  payment: {
+    /**
+     * Ceiling for one settlement. It locks the payment and then up to two
+     * wallets, so this covers three row locks and four writes -- nothing here
+     * routes or prices anything, so it is a slow-database allowance rather than
+     * a workload one.
+     */
+    transactionTimeoutMs: toNumber(process.env.PAYMENT_TRANSACTION_TIMEOUT_MS, 10_000),
+  },
 };
 
 /**

@@ -511,6 +511,8 @@ enum RideEventType {
   PASSENGER_FARE_REDUCED
   /// The trip: the driver reached this passenger's pickup stop.
   DRIVER_ARRIVED
+  /// TeslaPay: this passenger's fare for this journey was settled.
+  RIDE_PAID
 
   @@map("ride_event_type")
 }

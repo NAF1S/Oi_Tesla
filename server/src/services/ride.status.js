@@ -97,6 +97,8 @@ export const RIDE_EVENT_TYPE = Object.freeze({
   RIDE_COMPLETED: 'RIDE_COMPLETED',
   PASSENGER_PICKED_UP: 'PASSENGER_PICKED_UP',
   PASSENGER_DROPPED_OFF: 'PASSENGER_DROPPED_OFF',
+  // TeslaPay. The journey was settled, and the method is in the metadata.
+  RIDE_PAID: 'RIDE_PAID',
 });
 
 export const RIDE_ACTOR_TYPE = Object.freeze({

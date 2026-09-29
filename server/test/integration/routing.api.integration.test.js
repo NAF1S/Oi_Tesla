@@ -1088,14 +1088,15 @@ describe('phase boundary', () => {
     assert.strictEqual(unauthenticated.status, 401);
   });
 
-  it('introduces no shared, seated or payment table', async () => {
+  it('introduces no shared or seated table', async () => {
     // The routing milestone also asserted that *pricing* was absent. The fare
     // milestone lifted that half deliberately, the ride-request milestone added
-    // the ride tables, the dispatch milestone added the pool tables and the
-    // shared-fare milestone added the two pool-fare tables. What must still hold
-    // is that nothing shared, seated, assigned or paid exists -- a shared *fare*
-    // is not a shared *ride*: each passenger still has their own request, and the
-    // fare tables only record what each of them owes for the plan they are on.
+    // the ride tables, the dispatch milestone added the pool tables, the
+    // shared-fare milestone added the two pool-fare tables and the TeslaPay
+    // milestone added the three wallet tables. What must still hold is that
+    // nothing shared, seated or assigned exists -- a shared *fare* is not a shared
+    // *ride*: each passenger still has their own request, and the fare and wallet
+    // tables only record what each of them owes and what they paid with.
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -1105,6 +1106,7 @@ describe('phase boundary', () => {
 
     assert.deepStrictEqual(rows.map((row) => row.table_name), [
       'dispatch_offers',
+      'payments',
       'pool_events',
       'pool_fare_calculations',
       'pool_fare_legs',
@@ -1113,6 +1115,8 @@ describe('phase boundary', () => {
       'ride_events',
       'ride_pools',
       'ride_requests',
+      'wallet_accounts',
+      'wallet_ledger',
     ]);
   });
 

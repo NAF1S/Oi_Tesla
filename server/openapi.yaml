@@ -158,6 +158,10 @@ tags:
       require the `DRIVER` role and answer only about the caller.
   - name: Documentation
     description: This document.
+  - name: TeslaPay
+    description: |
+      The simulated wallet: what a caller owes or is owed, their balance, and
+      settling a completed journey from the balance or in cash.
 
 security:
   - cookieAuth: []
@@ -2153,6 +2157,221 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: A stop is unfinished, a passenger is aboard, a ride is open, or the fare is not frozen.
+
+  # -------------------------------------------------------------------------
+  # TeslaPay
+  # -------------------------------------------------------------------------
+  /payments/me:
+    get:
+      tags: [TeslaPay]
+      summary: What the caller owes, or is owed
+      description: |
+        The payments the caller is on either side of. A passenger sees the
+        journeys they owe for and what they have settled; a driver sees the fares
+        they have collected and those still outstanding. The role on the
+        authenticated record decides which, so there is no parameter to choose a
+        side and nothing in the path names a user.
+
+        Every amount is an exact decimal string, like the rest of this API's
+        money. `payable` is the server's answer to "should there be a Pay
+        button", so a client does not derive it from `status`.
+
+        The list is under `payments` rather than `data`: `side` and `totals`
+        belong to the same response, and `data` is reserved for the responses
+        that are nothing but a collection.
+      operationId: listMyPayments
+      parameters: []
+      responses:
+        '200':
+          description: The caller's payments, and their totals.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [side, payments, totals]
+                properties:
+                  side:
+                    type: string
+                    enum: [passenger, driver]
+                    description: Which side of these payments the caller is on.
+                  payments:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        rideRequestId: { type: string, format: uuid }
+                        ridePoolId: { type: string, format: uuid }
+                        amount: { type: string }
+                        currency: { type: string }
+                        status: { type: string, enum: [PENDING, PAID] }
+                        method: { type: string, nullable: true, enum: [TESLA_PAY, CASH] }
+                        methodLabel: { type: string, nullable: true }
+                        payable: { type: boolean }
+                        settled: { type: boolean }
+                        paidAt: { type: string, format: date-time, nullable: true }
+                        createdAt: { type: string, format: date-time }
+                        payerName: { type: string }
+                        driverName: { type: string }
+                        trip:
+                          type: object
+                          description: The journey this settles, when it comes from the list.
+                          properties:
+                            pickup: { type: string }
+                            dropoff: { type: string }
+                            poolStatus: { type: string }
+                            completedAt: { type: string, format: date-time, nullable: true }
+                  totals:
+                    type: object
+                    required: [outstanding, settled, total]
+                    properties:
+                      outstanding: { type: string }
+                      settled: { type: string }
+                      total: { type: integer }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /payments/me/wallet:
+    get:
+      tags: [TeslaPay]
+      summary: The caller's TeslaPay balance
+      description: |
+        The caller's balance and the movements that produced it, newest first.
+
+        The balance is a cache and not the truth: it is derived from these
+        entries, and the database refuses to commit the two disagreeing, so this
+        number and the list beneath it cannot drift apart. An entry is either a
+        settlement (`DEBIT` when someone paid, `CREDIT` when someone was paid) or
+        a `TOP_UP`.
+      operationId: getMyWallet
+      parameters: []
+      responses:
+        '200':
+          description: The wallet.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [wallet]
+                properties:
+                  wallet:
+                    type: object
+                    required: [balance, currency, updatedAt, entries]
+                    properties:
+                      balance: { type: string }
+                      currency: { type: string }
+                      updatedAt: { type: string, format: date-time }
+                      entries:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            direction: { type: string, enum: [DEBIT, CREDIT] }
+                            amount: { type: string }
+                            balanceAfter: { type: string }
+                            counterpartName: { type: string }
+                            method: { type: string, nullable: true, enum: [TESLA_PAY, CASH] }
+                            rideRequestId: { type: string, nullable: true, format: uuid }
+                            createdAt: { type: string, format: date-time }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+
+  /payments/rides/{rideRequestId}/pay:
+    post:
+      tags: [TeslaPay]
+      summary: Settle a completed journey
+      description: |
+        Settles this passenger's own payment for one journey, from their TeslaPay
+        balance or in cash.
+
+        `TESLA_PAY` moves money: the passenger is debited and the driver credited,
+        in one transaction. `CASH` records that the fare was handed over and moves
+        nothing -- the money changed hands in the car, so writing a matching pair
+        of ledger entries would invent money that never existed here.
+
+        **A settlement happens exactly once.** Settling an already-settled payment
+        returns it unchanged rather than failing, whatever method is asked for, so
+        a retried request needs no special handling. The database enforces the same
+        thing with one ledger entry per account per payment.
+
+        A fare the balance cannot cover is refused with `409` and a sentence naming
+        the shortfall, and nothing is written: the payment stays `PENDING` and can
+        still be settled in cash.
+      operationId: payForRide
+      parameters:
+        - name: rideRequestId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          description: The journey being settled. It must be the caller's own; another passenger's is a 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method]
+              additionalProperties: false
+              properties:
+                method:
+                  type: string
+                  enum: [TESLA_PAY, CASH]
+            examples:
+              byBalance:
+                summary: Pay from the TeslaPay balance
+                value: { method: TESLA_PAY }
+              inCash:
+                summary: Record the fare as paid in cash
+                value: { method: CASH }
+      responses:
+        '200':
+          description: |
+            The settled payment. `wallet` carries the payer's new balance so a
+            client need not re-read the wallet; it is `null` for cash and for a
+            repeat of a payment that was already settled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [payment, wallet, settled]
+                properties:
+                  payment:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      rideRequestId: { type: string, format: uuid }
+                      ridePoolId: { type: string, format: uuid }
+                      amount: { type: string }
+                      currency: { type: string }
+                      status: { type: string, enum: [PENDING, PAID] }
+                      method: { type: string, nullable: true, enum: [TESLA_PAY, CASH] }
+                      methodLabel: { type: string, nullable: true }
+                      payable: { type: boolean }
+                      settled: { type: boolean }
+                      paidAt: { type: string, format: date-time, nullable: true }
+                      createdAt: { type: string, format: date-time }
+                      payerName: { type: string }
+                      driverName: { type: string }
+                  wallet:
+                    type: object
+                    nullable: true
+                    properties:
+                      balance: { type: string }
+                      currency: { type: string }
+                  settled:
+                    type: boolean
+                    description: False when this call settled nothing because it already had been.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/WrongRole'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The TeslaPay balance does not cover the fare. Nothing was written.
 
 components:
   securitySchemes:

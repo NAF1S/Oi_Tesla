@@ -1,3 +1,4 @@
+import { PaymentPanel } from "@/components/payment/payment-panel";
 import { RideTracker } from "@/components/passenger/ride-tracker";
 import { Heading, PageShell } from "@/components/ui";
 import { getCurrentRide } from "@/lib/passenger-api";
@@ -37,6 +38,14 @@ export default async function TrackPage() {
         Your ride
       </Heading>
       <RideTracker initialRide={ride} />
+      {/*
+        TeslaPay sits below the tracker and reads only the passenger's own
+        payments, so it needs nothing from the ride above it. That also means it
+        is here for the whole visit rather than appearing with the ride: a fare
+        left unsettled from an earlier journey is exactly as payable now as it was
+        when the car stopped.
+      */}
+      <PaymentPanel />
     </PageShell>
   );
 }

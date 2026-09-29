@@ -1026,7 +1026,7 @@ describe('phase boundary', () => {
     }
   });
 
-  it('introduces the ride and dispatch tables and nothing pooled, matched or paid', async () => {
+  it('introduces the ride and dispatch tables and nothing shared or seated', async () => {
     const { rows } = await pool.query(
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public'
@@ -1034,11 +1034,13 @@ describe('phase boundary', () => {
         ORDER BY table_name`,
     );
 
-    // The dispatch milestone added the four pool/dispatch tables, and the
-    // shared-fare milestone added the two pool-fare tables; what must still be
-    // absent is anything shared, seated, paid or assigned to a driver.
+    // The dispatch milestone added the four pool/dispatch tables, the shared-fare
+    // milestone added the two pool-fare tables, and the TeslaPay milestone added
+    // the three wallet tables; what must still be absent is anything shared,
+    // seated or assigned to a driver.
     assert.deepStrictEqual(rows.map((row) => row.table_name), [
       'dispatch_offers',
+      'payments',
       'pool_events',
       'pool_fare_calculations',
       'pool_fare_legs',
@@ -1047,6 +1049,8 @@ describe('phase boundary', () => {
       'ride_events',
       'ride_pools',
       'ride_requests',
+      'wallet_accounts',
+      'wallet_ledger',
     ]);
   });
 

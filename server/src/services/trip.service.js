@@ -13,6 +13,7 @@ import {
   POOL_STOP_TYPE,
 } from './dispatch.rules.js';
 import { requireDriverProfileId } from './driver.service.js';
+import { createPaymentsForPool } from './payment.service.js';
 import { finalizePoolFareCalculation } from './pool-fare.service.js';
 import { appendPoolEvent, lockPool, lockPoolStops } from './pool.service.js';
 import {
@@ -976,6 +977,13 @@ export const completeTrip = async ({ driver, ridePoolId, now = new Date() }) => 
         currentServicePointId: endedAtPointId,
       },
     });
+
+    // TeslaPay: the journey is over, so each passenger now owes the amount they
+    // were already told they owed. This runs here rather than in a sweeper
+    // because a completed trip without its debts is a state the product cannot
+    // reach -- and `payments_ride_request_key` makes a retried completion a
+    // no-op instead of a double charge.
+    await createPaymentsForPool({ tx, ridePoolId, now });
 
     await appendPoolEvent(tx, {
       ridePoolId: pool.id,

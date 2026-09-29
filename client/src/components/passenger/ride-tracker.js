@@ -9,6 +9,7 @@ import { MEMBER_STATUS, NEXT_ACTION, PASSENGER_STAGE, POOL_STATUS, STOP_STATUS, 
 import { Button, Facts, Heading, LinkButton, Notice, Panel } from "@/components/ui";
 import { Chip, Labeled, PlaceLine, RideStatusChip } from "@/components/status-chip";
 import { EmptyState, ErrorState, Loading } from "@/components/async-state";
+import { SettlePayment } from "@/components/payment/settle-payment";
 import { CancelRequest } from "./cancel-request";
 
 /**
@@ -219,6 +220,10 @@ export function RideTracker({ initialRide = null, pollIntervalMs = POLL_INTERVAL
         lastRide={lastRide}
         loading={finishing}
         onRetry={settleArrival}
+        // Paying is followed by re-reading the ride, so the timeline below gains
+        // the "Ride paid" entry the settlement wrote rather than staying as it
+        // was when the car stopped.
+        onSettled={settleArrival}
       />
     );
   }
@@ -446,7 +451,7 @@ function Timeline({ ride }) {
  * `lastRide` is still rendered while the detail is in flight, so the screen shows
  * the journey it knows about rather than a spinner over nothing.
  */
-function RideEnded({ ride, lastRide, loading, onRetry }) {
+function RideEnded({ ride, lastRide, loading, onRetry, onSettled }) {
   const status = ride?.status ?? null;
   const completed = status === "COMPLETED";
   const cancelled = status === "CANCELLED";
@@ -528,6 +533,21 @@ function RideEnded({ ride, lastRide, loading, onRetry }) {
             ))}
           </ol>
         </div>
+      ) : null}
+
+      {/*
+        The fare is settled here, at the moment the passenger is still sitting in
+        the car that just stopped, rather than only on the tracking page they will
+        navigate away from. `SettlePayment` renders nothing at all for a ride with
+        no payment behind it -- a cancelled one, or one whose trip has not finished
+        -- so a completed journey is the only case that shows a button.
+      */}
+      {completed && ride?.rideRequestId ? (
+        <SettlePayment
+          className="mt-5"
+          rideRequestId={ride.rideRequestId}
+          onSettled={onSettled}
+        />
       ) : null}
 
       <div className="mt-5 flex justify-center gap-3">

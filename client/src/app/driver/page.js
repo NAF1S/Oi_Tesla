@@ -1,4 +1,5 @@
 import { DriverConsole } from "@/components/driver/driver-console";
+import { EarningsPanel } from "@/components/payment/payment-panel";
 import { Heading, PageShell } from "@/components/ui";
 import { getAvailability, getCurrentPool, listOffers } from "@/lib/driver-api";
 import { listServicePoints } from "@/lib/location-api";
@@ -50,6 +51,14 @@ export default async function DriverPage() {
       </Heading>
 
       <DriverConsole initial={{ availability, offers, pool, servicePoints }} />
+
+      {/*
+        TeslaPay, from the driver's side of the same table. It is deliberately
+        its own panel and its own fetch rather than part of the console's poll:
+        money does not change on a five-second heartbeat, and folding an earnings
+        read into the dispatch loop would make every poll pay for it.
+      */}
+      <EarningsPanel />
     </PageShell>
   );
 }
