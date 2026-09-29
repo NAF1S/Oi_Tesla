@@ -1,7 +1,7 @@
 ---
 title: TeslaB — database (ERD)
 ---
-%% TeslaB database schema. 21 application tables, generated from the live schema.
+%% TeslaB database schema. 24 application tables, generated from the live schema.
 %% Only the keys and the columns that carry meaning in the domain are shown;
 %% migration files under server/db/ are the source of truth.
 erDiagram
@@ -193,6 +193,34 @@ erDiagram
         numeric share_ratio
         numeric allocated_amount
     }
+    WALLET_ACCOUNTS {
+        uuid id PK
+        uuid user_id FK "unique"
+        text currency
+        numeric balance "never negative"
+    }
+    PAYMENTS {
+        uuid id PK
+        uuid ride_request_id FK "unique: payable once"
+        uuid ride_pool_id FK
+        uuid fare_calculation_id FK
+        uuid payer_user_id FK
+        uuid driver_user_id FK
+        numeric amount
+        text currency
+        enum method "TESLA_PAY | CASH"
+        enum status "PENDING | PAID"
+        timestamptz paid_at
+    }
+    WALLET_LEDGER {
+        uuid id PK
+        uuid account_id FK
+        uuid payment_id FK "nullable: outlives the payment"
+        enum reason "PAYMENT | TOP_UP"
+        enum direction "DEBIT | CREDIT"
+        numeric amount
+        numeric balance_after
+    }
 
     USERS ||--o| PASSENGER_PROFILES : "is a"
     USERS ||--o| DRIVER_PROFILES : "is a"
@@ -236,3 +264,10 @@ erDiagram
     RIDE_REQUESTS ||--o{ PASSENGER_FARE_ALLOCATIONS : "billed for"
     PASSENGER_FARE_ALLOCATIONS ||--o{ PASSENGER_FARE_LEG_SHARES : "itemised as"
     POOL_FARE_LEGS ||--o{ PASSENGER_FARE_LEG_SHARES : "shared as"
+    USERS ||--|| WALLET_ACCOUNTS : "holds one"
+    WALLET_ACCOUNTS ||--o{ WALLET_LEDGER : "records"
+    RIDE_REQUESTS ||--o| PAYMENTS : "settles"
+    RIDE_POOLS ||--o{ PAYMENTS : "billed as"
+    USERS ||--o{ PAYMENTS : "party to"
+    PAYMENTS |o--o{ WALLET_LEDGER : "moves"
+    FARE_POLICIES ||--o{ PAYMENTS : "implied by"
