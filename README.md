@@ -36,6 +36,7 @@ is owed. There is no payment gateway, no GPS and no push notifications; see
 - [API overview](#api-overview)
 - [Key decisions and trade-offs](#key-decisions-and-trade-offs)
 - [Concurrency and data consistency](#concurrency-and-data-consistency)
+- [Scaling to 1M passengers and 100k drivers](#scaling-to-1m-passengers-and-100k-drivers)
 - [Known limitations](#known-limitations)
 - [Next improvements](#next-improvements)
 - [AI usage](#ai-usage)
@@ -909,6 +910,270 @@ coordinate, or once the lock is held long enough to matter.
    that every writer contending for one car is in the same place. Partitioning is
    usually the cheaper answer: two passengers competing for one car are, by definition,
    in the same city.
+
+## Scaling to 1M passengers and 100k drivers
+
+This is a reasoning exercise, not a roadmap. The demo is nowhere near these numbers, and
+most of what follows is work I would not start until a measurement demanded it. The
+useful part is knowing *which* measurement, and in what order.
+
+### The numbers that decide everything
+
+| | |
+| --- | --- |
+| Rides | ~2M/day if each passenger rides twice — **~23 rides/s average, ~100/s at peak** |
+| Writes per ride | ~10 (request, offer, accept, six trip commands, complete, settle) — **~1k writes/s peak** |
+| **Polling** | 100k online drivers × one offer read every 5 s — **20,000 req/s** |
+| …and each poll is **three sequential reads** | availability + offers + current-pool — **~60,000 req/s** |
+
+That last row is the whole answer. **Matching is not the bottleneck; asking whether
+anything changed is.** Against ~100 rides/s of real work, ~60k req/s of clients
+confirming that nothing happened is 99.8% of the traffic — and it is not read-only,
+because reading a driver's offers refreshes `last_seen_at`. *Reading your offers is also
+how the server knows you are still there* was the right design for a demo with one
+driver. At 100k it is 20,000 writes/s saying "this driver still exists".
+
+### What breaks, in order
+
+1. **The heartbeat row.** One `UPDATE driver_profiles SET last_seen_at = now()` per
+driver per 5 s, each bumping `updated_at` through a trigger and generating WAL. The
+first change is not structural: a Redis TTL — `SET driver:alive:<id> EX 300` — expresses
+the same fact for nothing.
+2. **Polling itself.** Replace both polls with push: offers push on creation, ride
+updates push on each `ride_events` append. The append-only timeline is already the event
+source, so this is a transport change rather than a redesign. A million concurrent
+connections needs a fan-out layer keyed by user id, and is sticky at the edge even
+though the API stays stateless.
+3. **Routing CPU.** Every request routes the passenger *and* routes each candidate for
+approach time: ~100 rides/s × up to 20 candidates is thousands of `pgr_dijkstra` calls a
+second, and pgRouting is CPU-bound per query. One of the two fixes is nearly free:
+journeys here are between *named service points*, so a route is a pure function of
+`(graph_version, origin, destination, rush_hour)` — a small, highly reusable key space.
+Precomputing that matrix is the largest CPU saving available.
+4. **The liveness signal must survive the transport change.** Delete the poll naively and
+drivers stop being eligible after 300 s.
+
+### The target shape
+
+```mermaid
+---
+title: TeslaB at scale — what changes, and where
+---
+flowchart TB
+    subgraph clients["Clients"]
+        direction LR
+        pax(["Passenger apps"])
+        drv(["Driver apps"])
+    end
+
+    subgraph edge["Edge"]
+        direction TB
+        waf["WAF + L7 load balancer<br/>health-checked, no sticky sessions<br/>the API is stateless"]
+        ws["WebSocket gateway<br/>sticky at the connection layer<br/>replaces the 5 s poll"]
+    end
+
+    subgraph api["Stateless API pool"]
+        direction TB
+        inst["Express instances &mdash; scale out freely<br/>a JWT in an HttpOnly cookie means<br/>there is no server session to replicate"]
+        limit["Rate limiting<br/>token bucket: auth, writes, offers"]
+    end
+
+    subgraph workers["Workers"]
+        direction TB
+        matcher["Matcher &mdash; geo-sharded by city<br/>the only CPU-bound tier: routing<br/>the one plausible extraction"]
+        sweeper["Sweeper &mdash; leader-elected<br/>expiry, re-offer, retry"]
+        fan["Notifications, analytics<br/>fan-out only, never on the critical path"]
+    end
+
+    subgraph redis["Redis"]
+        direction TB
+        alive["Driver liveness TTL<br/>replaces the heartbeat UPDATE"]
+        geo["GEO index<br/>driver shortlist by distance"]
+        routes["Route cache<br/>graph version, origin, destination, rush hour"]
+        keys["Idempotency keys, rate counters"]
+    end
+
+    subgraph pg["PostgreSQL"]
+        direction TB
+        primary["Primary &mdash; all writes, and every read<br/>you are about to act on"]
+        replicas["Read replicas &mdash; history, timelines,<br/>reference data. Never a pending offer."]
+        partitions["Partitioned by month:<br/>ride_events, pool_events, wallet_ledger"]
+    end
+
+    queue["Delayed queue<br/>offer expiry and the re-offer cascade<br/>instead of a 30 s sweep"]
+
+    pax --> waf
+    drv --> ws
+    waf --> inst
+    ws --> inst
+    inst --> limit
+    inst --> redis
+    inst --> primary
+    inst --> queue
+    queue --> matcher
+    matcher --> geo
+    matcher --> routes
+    matcher --> primary
+    matcher --> ws
+    sweeper --> primary
+    fan --> ws
+    inst -.->|"history, reference"| replicas
+    primary --> replicas
+    primary --- partitions
+
+    classDef place fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef app fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef domain fill:#dcfce7,stroke:#16a34a,color:#052e16
+    classDef store fill:#fef3c7,stroke:#d97706,color:#451a03
+    classDef side fill:#f4f4f5,stroke:#71717a,color:#27272a,stroke-dasharray:4 3
+
+    class pax,drv place
+    class waf,ws,inst,limit,matcher,sweeper,fan app
+    class queue side
+    class alive,geo,routes,keys store
+    class primary,replicas,partitions domain
+```
+
+The source is `docs/scaling.mmd`. What the diagram is really saying is where each remedy
+*lives*: push at the edge, liveness out of Postgres and into Redis, routing as the only
+CPU-bound tier, and reads split by consequence — history may lag, the offer you are about
+to accept may not.
+
+### Load balancing and horizontal scaling
+
+The API is **already stateless**: the session is a signed JWT in an HttpOnly cookie, so
+there is no server-side session to replicate. That is what makes scaling out free, and it
+is the property I would protect most carefully. No sticky sessions; an L7 balancer
+health-checking `/api/health` is enough. Two things are *not* horizontally scalable as
+written — the **sweeper**, where two instances would double-dispatch, and any in-process
+scheduling.
+
+### Indexes, replicas and contention
+
+Missing at scale: a **GiST index on `service_points.location`** for the radius query,
+**`dispatch_offers (driver_profile_id, status)`** — the hottest query in the system, run
+20k×/s — and `ride_requests (passenger_profile_id, requested_at DESC)` for history.
+
+**Replicas: yes for history, timelines and reference data; never for anything you are
+about to write against.** Serving the offer you are about to accept from a replica with
+200 ms of lag produces double accepts and accepts of expired offers. That is a
+correctness bug, not a freshness annoyance.
+
+**Partition by month**: `ride_events`, `pool_events` and especially `wallet_ledger`. The
+ledger is the highest-write table and already append-only, so it partitions cleanly.
+Contended rows, worst first: `driver_profiles.last_seen_at` (the heartbeat),
+`wallet_accounts.balance` — a busy driver's wallet is serialized on every settlement, so at
+scale stop updating it inline and materialize it periodically, since the ledger is already
+the source of truth — and `ride_pools.version`.
+
+### Caching
+
+Cache the immutable and the derived. **`fare_policies` is already versioned** with
+`effective_from` / `effective_to`, which makes it a natural cache key rather than one
+needing a TTL. Service points and zones. The **route matrix** above. Never cache
+availability, offers, a current pool or ride state — nothing a user is about to act on.
+Redis holds the route cache, driver liveness, offer presence, rate counters and
+idempotency keys.
+
+### Geospatial search
+
+The existing two-stage design — PostGIS radius shortlist, then route each candidate — is
+correct and stays. At scale the shortlist moves to **Redis GEO** while Postgres remains
+the durable record. The structural point: **dispatch is local, so the shard key is
+geography.** A matcher needs only its own city's drivers and requests; no cross-region
+coordination is required, which means this scales by *partitioning* rather than by
+distributing.
+
+### Queues and events
+
+Keep the critical path synchronous until p95 matching latency is the binding constraint.
+Make asynchronous what is already batch-shaped: offer expiry and the re-offer cascade (a
+**delayed queue**, not a 30-second sweep), request expiry, fare recalculation,
+notifications, analytics. The append-only event tables are a natural **outbox**. Kafka
+belongs on the fan-out side, never in the dispatch path.
+
+### Rate limiting
+
+Nothing exists today. Needed on authentication — bcrypt at cost 10 is a CPU denial-of-service
+vector, so concurrent verifications need capping — on writes per user, and on offer
+actions per driver. Redis token bucket. The polling endpoints need *replacement* rather
+than a limit: throttling them just makes the product worse.
+
+### Idempotency
+
+Mostly already right, and the reasoning is worth stating plainly: **the durable
+idempotency mechanism is a database unique constraint, not an HTTP header.** The header
+only names the key. Ride requests have one; payments are unique on `ride_request_id` and
+a repeat returns the original outcome; trip commands already treat a repeated `arrive` as
+a retry. Extend to offer acceptance — the offer id is the natural key — and keep a TTL'd
+key table for the rest.
+
+### Observability
+
+Alert on the **matching funnel**, not on 5xx. The dangerous failure here is silent: a
+request that never matched and never errored. `POOL_CANDIDATE_EVALUATED` already records
+`candidatePools` and `rejections` per request, so the funnel metric is a query away rather
+than new instrumentation. Track sweeper lag (oldest waiting request, offers expired
+unclaimed), route-cache hit rate, and settlement rate as a business SLO.
+
+### Retry and failure
+
+Already present: `retryWaitingRequests`, offer expiry and re-offer,
+`DISPATCH_TRANSACTION_TIMEOUT_MS`, and statement timeouts on routing. Add exponential
+backoff with jitter on clients, bounded retries on transient database errors, a **circuit
+breaker on the routing layer** — if pgRouting degrades, stop matching into a degraded mode
+rather than queueing work behind it — and a dead-letter path for events that fail to
+publish. The domain already has the vocabulary for degrading honestly: a request that
+cannot be matched becomes `WAITING` with a search window.
+
+### Security
+
+The existing posture is strong and worth preserving deliberately: HttpOnly cookie, no
+token in JavaScript, **no user id in any path**, 404-not-403 so ids cannot be confirmed,
+whitelist DTOs, and an offer snapshot that deliberately excludes passenger identity. Two
+gaps for production: a single `JWT_SECRET` with no `kid`, so **key rotation needs a
+dual-key window that does not exist yet**; and `COOKIE_SECURE=false` in the compose file,
+which must be `true`. Add secrets from a KMS with rotation, WAF and edge DDoS protection,
+and audit logging of money movement — the wallet ledger already *is* that audit log. If a
+real payment provider arrives, card data must never touch these servers.
+
+One code-review rule worth writing down: `$queryRawUnsafe` is only safe because every call
+site binds parameters. That is a convention a new contributor can break without noticing.
+
+### Deployment
+
+Migrations must become **expand/contract**, because old and new code run simultaneously
+during a rollout. The existing convention — idempotent, cumulative, append a convergence
+section rather than editing what was applied — is *already* compatible with that, which is
+a genuine strength. Move `migrate` and `seed` out of the service lifecycle into a deploy
+step. Run the sweeper as a singleton. Add PgBouncer: 100k driver connections is
+impossible, and the pooled-connection note in [Deployment](#deployment) applies to
+everything at this size.
+
+One property worth naming: the matching rule is **versioned** (`pool-match.v2`). That is
+not only documentation — it is a rollout mechanism, so a v3 can be shadow-run against v2
+on live traffic before it decides anything.
+
+### What I would not build yet
+
+No microservices — the matcher is the only plausible extraction, and only because routing
+is CPU-bound rather than I/O-bound. No Kafka on the critical path. No sharding until a
+single primary is genuinely saturated; **vertical scaling, replicas and partitioning come
+first and go further than people expect.** No separate real-time service while polling
+still fits.
+
+### Staged
+
+| Stage | Scale | Change |
+| --- | --- | --- |
+| 0 | today | Synchronous dispatch, 5 s polling, one primary |
+| 1 | 10k drivers | Push instead of poll; GiST and hot-path indexes; PgBouncer; ledger partitioned; heartbeat to Redis |
+| 2 | 100k drivers | Geo-shard dispatch by city; Redis GEO for location; async matching with a delayed queue; route cache; leader-elected sweeper; extract the matcher |
+| 3 | 1M+ | Multi-region, partitioned by city, with no cross-region coordination |
+
+**In one line:** this design's scaling story is not "make matching faster". It is "stop
+asking 100,000 phones whether anything has changed". Everything after that is ordinary
+work.
 
 ## Known limitations
 

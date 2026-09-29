@@ -1,0 +1,81 @@
+---
+title: TeslaB at scale — what changes, and where
+---
+%% The target shape at 1M passengers / 100k drivers.
+%% The point of the diagram is not the number of boxes but where each remedy lives:
+%% push replaces polling at the edge, liveness moves out of Postgres into Redis,
+%% routing is the only tier that is CPU-bound, and reads split by consequence
+%% (history may lag; the offer you are about to accept may not).
+flowchart TB
+    subgraph clients["Clients"]
+        direction LR
+        pax(["Passenger apps"])
+        drv(["Driver apps"])
+    end
+
+    subgraph edge["Edge"]
+        direction TB
+        waf["WAF + L7 load balancer<br/>health-checked, no sticky sessions<br/>the API is stateless"]
+        ws["WebSocket gateway<br/>sticky at the connection layer<br/>replaces the 5 s poll"]
+    end
+
+    subgraph api["Stateless API pool"]
+        direction TB
+        inst["Express instances &mdash; scale out freely<br/>a JWT in an HttpOnly cookie means<br/>there is no server session to replicate"]
+        limit["Rate limiting<br/>token bucket: auth, writes, offers"]
+    end
+
+    subgraph workers["Workers"]
+        direction TB
+        matcher["Matcher &mdash; geo-sharded by city<br/>the only CPU-bound tier: routing<br/>the one plausible extraction"]
+        sweeper["Sweeper &mdash; leader-elected<br/>expiry, re-offer, retry"]
+        fan["Notifications, analytics<br/>fan-out only, never on the critical path"]
+    end
+
+    subgraph redis["Redis"]
+        direction TB
+        alive["Driver liveness TTL<br/>replaces the heartbeat UPDATE"]
+        geo["GEO index<br/>driver shortlist by distance"]
+        routes["Route cache<br/>graph version, origin, destination, rush hour"]
+        keys["Idempotency keys, rate counters"]
+    end
+
+    subgraph pg["PostgreSQL"]
+        direction TB
+        primary["Primary &mdash; all writes, and every read<br/>you are about to act on"]
+        replicas["Read replicas &mdash; history, timelines,<br/>reference data. Never a pending offer."]
+        partitions["Partitioned by month:<br/>ride_events, pool_events, wallet_ledger"]
+    end
+
+    queue["Delayed queue<br/>offer expiry and the re-offer cascade<br/>instead of a 30 s sweep"]
+
+    pax --> waf
+    drv --> ws
+    waf --> inst
+    ws --> inst
+    inst --> limit
+    inst --> redis
+    inst --> primary
+    inst --> queue
+    queue --> matcher
+    matcher --> geo
+    matcher --> routes
+    matcher --> primary
+    matcher --> ws
+    sweeper --> primary
+    fan --> ws
+    inst -.->|"history, reference"| replicas
+    primary --> replicas
+    primary --- partitions
+
+    classDef place fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef app fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    classDef domain fill:#dcfce7,stroke:#16a34a,color:#052e16
+    classDef store fill:#fef3c7,stroke:#d97706,color:#451a03
+    classDef side fill:#f4f4f5,stroke:#71717a,color:#27272a,stroke-dasharray:4 3
+
+    class pax,drv place
+    class waf,ws,inst,limit,matcher,sweeper,fan app
+    class queue side
+    class alive,geo,routes,keys store
+    class primary,replicas,partitions domain

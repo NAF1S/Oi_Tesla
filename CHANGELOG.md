@@ -20,6 +20,56 @@ Release process:
 
 Nothing yet.
 
+## [1.0.0] — 2026-09-29
+
+**The first release with a stable API surface.** There is no new functionality here — the
+feature set was complete at `0.1.0-beta.1`. What this version adds is the documentation
+set, and the promise that the endpoints in `server/openapi.yaml` are the ones to build
+against.
+
+It also ships with two known test failures. That is deliberate, and they are described
+below rather than buried. See *Known issues* in the README for the full list.
+
+### Added
+
+- `README.md` rewritten around the order a reader needs: summary, problem statement,
+  features, architecture and ERD, setup, Docker, deployment, API overview, trade-offs and
+  limitations. The previous README is kept as `prd.md` — it is the milestone-by-milestone
+  write-up and a far better record of *why* the system is shaped this way than a summary
+  can be.
+- A **Concurrency and data consistency** section, working the one-seat-left race through
+  in detail: what actually serializes it, which guarantees the database holds, which one
+  it does not, and what would change at larger scale.
+- A **Scaling to 1M passengers and 100k drivers** section with its own diagram
+  (`docs/scaling.mmd`), bounded by an explicit account of what would *not* be built.
+- `docs/scaling.mmd`, plus the architecture and ERD diagrams brought up to date for
+  TeslaPay — 24 tables, up from 21.
+- `CHANGELOG.md`.
+
+### Known issues
+
+- **Two assertions fail in `pool-fare.integration.test.js`, and both are one bug.** A
+  solo passenger off-peak has `solo_cap_applied = true` where it should be `false`. The
+  uncapped pooled fare computes to `40.00 + 183.78 = 223.78` against an accepted solo
+  quote of `220.00`, so the solo cap clamps it down by `3.78`. Because a reduction
+  occurred, the timeline then records `PASSENGER_FARE_REDUCED` rather than
+  `PASSENGER_FARE_ALLOCATED` — that is the second failure, and fixing the cap fixes both.
+
+  The leg's journey component appears to be `183.78` where the quote implies `180.00` for
+  the same journey. **Which of the two numbers is wrong has not been established**, and
+  the pricing arithmetic was deliberately not adjusted to make the test pass.
+
+- **The pool-join offer fix is unverified.** Offers are now reachable for a driver already
+  on a ride — the condition asked for a driver's last reported service point rather than
+  where their plan starts — but no test covers that path, so an otherwise green suite does
+  not confirm it works.
+
+- **There is no `members <= capacity_snapshot` constraint.** Capacity is the one rule in
+  the schema enforced only by service code under a row lock.
+
+- The full list, including the sweeper requirement and the two disagreeing timeouts, is in
+  the README's *Known limitations*.
+
 ## [0.1.0-beta.1] — 2026-09-29
 
 The first pre-release. **Both halves of the loop work end to end**: a passenger can
@@ -126,5 +176,6 @@ This is a demo, not a product. See *Known issues* below before reading anything 
 - The routing graph is a teaching network, not a map of Dhaka: only 1521 of 2025 ordered
   vertex pairs are reachable.
 
-[Unreleased]: https://github.com/NAF1S/BTesla/compare/v0.1.0-beta.1...HEAD
+[Unreleased]: https://github.com/NAF1S/BTesla/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/NAF1S/BTesla/releases/tag/v1.0.0
 [0.1.0-beta.1]: https://github.com/NAF1S/BTesla/releases/tag/v0.1.0-beta.1

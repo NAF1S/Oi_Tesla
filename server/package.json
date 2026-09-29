@@ -1,6 +1,6 @@
 {
   "name": "server",
-  "version": "0.1.0-beta.1",
+  "version": "1.0.0",
   "private": true,
   "description": "Express REST API for the TeslaB app",
   "type": "module",
