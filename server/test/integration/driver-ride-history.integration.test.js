@@ -99,7 +99,9 @@ const stopsOf = async (poolId) => {
 };
 
 /** A pool with one passenger, created the way the product creates one. */
-const createPool = async ({ driver, passenger, point = POINTS.NEAR }) => {
+// The driver stands at the pickup: under the v2 matching rule a pool can only
+// take another passenger if its driver is already on the shared start point.
+const createPool = async ({ driver, passenger, point = POINTS.PICKUP }) => {
   await goOnline(driver, point);
 
   const request = await requestRide(passenger);

@@ -41,7 +41,7 @@
  */
 
 /** Bumped when the matching rules change in a way that makes old plans stale. */
-export const MATCHING_RULE_VERSION = 'pool-match.v1';
+export const MATCHING_RULE_VERSION = 'pool-match.v2';
 
 /**
  * Only a pool that is still forming can be joined. A pool whose driver is on the
@@ -58,10 +58,6 @@ export const STOP_TYPE = Object.freeze({
 /** Candidate rejection reasons, recorded on the request's timeline. */
 export const PLAN_REJECTION = Object.freeze({
   OCCUPANCY: 'OCCUPANCY',
-  PICKUP_WAIT: 'PICKUP_WAIT',
-  ADDED_DURATION: 'ADDED_DURATION',
-  DETOUR: 'DETOUR',
-  DETOUR_RATIO: 'DETOUR_RATIO',
   UNROUTABLE: 'UNROUTABLE',
   NO_INSERTION: 'NO_INSERTION',
 });
@@ -337,39 +333,28 @@ export const planMetrics = ({
 /**
  * Whether a fully-measured plan is allowed.
  *
- * Every limit is configuration, and each one that fires is reported by name so the
- * request's timeline says *why* a pool was passed over rather than just that it
- * was.
+ * Two rides may share a car **if and only if**:
+ *
+ *   1. they start from the same service point -- enforced in the candidate query,
+ *      so any plan that reaches here already satisfies it, and every member of the
+ *      pool started from the same corner as the new one;
+ *   2. one destination is reachable from the other -- which is exactly what "the
+ *      leg between the two drop-offs routed" means. An unroutable insertion is
+ *      refused by the caller before this runs, so the reachability requirement is
+ *      already satisfied here too.
+ *
+ * That leaves occupancy: the vehicle is never over capacity on any segment.
+ *
+ * The waiting, added-duration and detour limits that used to live here were
+ * removed on purpose, and that is a product decision rather than an oversight:
+ * under the rule above a shared trip is allowed because the *shape* is right --
+ * same start, destinations on one another's routes -- not because the numbers came
+ * out small. What still protects a passenger's wallet is the fare: joining a pool
+ * never raises what anybody pays.
  */
-export const validatePlan = ({ occupancy, metrics, limits }) => {
+export const validatePlan = ({ occupancy }) => {
   if (!occupancy.valid) {
     return { valid: false, reason: PLAN_REJECTION.OCCUPANCY, detail: occupancy.detail };
-  }
-
-  if (metrics.pickupWaitSeconds > limits.maxPickupWaitSeconds) {
-    return { valid: false, reason: PLAN_REJECTION.PICKUP_WAIT };
-  }
-
-  if (metrics.addedDurationSeconds > limits.maxAddedPoolDurationSeconds) {
-    return { valid: false, reason: PLAN_REJECTION.ADDED_DURATION };
-  }
-
-  if (metrics.worstDetourSeconds > limits.maxExistingPassengerDetourSeconds) {
-    return { valid: false, reason: PLAN_REJECTION.DETOUR };
-  }
-
-  // A ratio is only meaningful against a real baseline; a passenger whose request
-  // predates one cannot be ratio-checked, and is checked absolutely instead.
-  const ratioChecked = metrics.passengerDurations.filter(
-    (passenger) => passenger.detourRatio !== null,
-  );
-  const worstRatio = ratioChecked.reduce(
-    (worst, passenger) => Math.max(worst, passenger.detourRatio),
-    0,
-  );
-
-  if (worstRatio > limits.maxExistingPassengerDetourRatio) {
-    return { valid: false, reason: PLAN_REJECTION.DETOUR_RATIO };
   }
 
   return { valid: true };

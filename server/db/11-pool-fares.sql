@@ -550,15 +550,36 @@ UPDATE pool_fare_calculations
 ALTER TABLE pool_fare_calculations
   ALTER COLUMN total_minimum_fare_uplift SET NOT NULL;
 
-ALTER TABLE pool_fare_calculations
-  DROP CONSTRAINT IF EXISTS pool_fare_calculations_totals_consistent;
+-- The re-add is guarded on `total_fare_rounding_adjustment` not existing yet.
+--
+-- This file runs before 14-fare-rounding.sql, which widens the very same
+-- constraint to account for the whole-Taka rounding adjustment. Adding the
+-- narrow version unconditionally would therefore fail on any database that
+-- already holds a pooled fare with a non-zero adjustment -- and every pooled
+-- fare has one, now that fares are charged in whole units. The guard keeps this
+-- file re-runnable, which is the property the whole migration set rests on:
+-- `npm run db:migrate` applies these files again and again, in order, to
+-- whatever the database already contains.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM information_schema.columns
+     WHERE table_schema = 'public'
+       AND table_name = 'pool_fare_calculations'
+       AND column_name = 'total_fare_rounding_adjustment'
+  ) THEN
+    ALTER TABLE pool_fare_calculations
+      DROP CONSTRAINT IF EXISTS pool_fare_calculations_totals_consistent;
 
-ALTER TABLE pool_fare_calculations
-  ADD CONSTRAINT pool_fare_calculations_totals_consistent CHECK (
-    total_uncapped_passenger_fare = total_passenger_base_fare + total_variable_route_cost
-    AND total_final_passenger_fare + total_solo_cap_reduction + total_no_increase_reduction
-        = total_uncapped_passenger_fare + total_minimum_fare_uplift
-  );
+    ALTER TABLE pool_fare_calculations
+      ADD CONSTRAINT pool_fare_calculations_totals_consistent CHECK (
+        total_uncapped_passenger_fare = total_passenger_base_fare + total_variable_route_cost
+        AND total_final_passenger_fare + total_solo_cap_reduction + total_no_increase_reduction
+            = total_uncapped_passenger_fare + total_minimum_fare_uplift
+      );
+  END IF;
+END $$;
 
 ALTER TABLE pool_fare_calculations
   DROP CONSTRAINT IF EXISTS pool_fare_calculations_amounts_not_negative;

@@ -31,7 +31,7 @@ Four things, and only one of them owns the schema.
 ## What a frontend indirectly depends on
 
 The seed decides the demo data every example and test uses — the 15 zones, 45
-service points, 46 routing edges, one pricing policy (`dhaka-solo` v1) and four
+service points, 47 routing edges, one pricing policy (`dhaka-solo` v1) and four
 accounts (Nusrat and Rafiq and Shirin as passengers, Jashim as the driver, one
 `Bullet` vehicle). Because it is idempotent and stable, a client can be developed
 against those ids and codes.

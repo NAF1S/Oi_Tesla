@@ -94,31 +94,40 @@ const CANDIDATE_POOLS_SQL = `
          dp.current_service_point_id,
          driver_point.code AS driver_point_code,
          (SELECT count(*)::int FROM pool_members pm WHERE pm.ride_pool_id = rp.id) AS member_count,
-         ST_Distance(pickup.location, rp.planned_route_geometry::geography)::float8
-           AS pickup_distance_meters,
-         ST_Distance(dropoff.location, rp.planned_route_geometry::geography)::float8
-           AS destination_distance_meters
+         -- Kept so the candidate record keeps its shape. Distance-to-route is no
+         -- longer a filter, so there is nothing meaningful to report here.
+         0::float8 AS pickup_distance_meters,
+         0::float8 AS destination_distance_meters
     FROM ride_pools rp
     JOIN driver_profiles dp ON dp.id = rp.driver_profile_id
     JOIN users du          ON du.id = dp.user_id
     JOIN vehicles v        ON v.id = rp.vehicle_id
     JOIN service_points driver_point ON driver_point.id = dp.current_service_point_id
-    JOIN service_points pickup  ON pickup.id = $1::uuid
-    JOIN service_points dropoff ON dropoff.id = $2::uuid
    WHERE rp.status = 'FORMING'
-     AND rp.planned_route_geometry IS NOT NULL
      AND du.active
      AND dp.status = 'RESERVED'
      AND v.active
      AND v.seat_capacity > 0
      AND driver_point.active
-     AND ST_DWithin(pickup.location, rp.planned_route_geometry::geography, $3::float8)
-     AND ($4::float8 IS NULL
-          OR ST_DWithin(dropoff.location, rp.planned_route_geometry::geography, $4::float8))
+     -- "The driver must be online on the starting point": the driver's own service
+     -- point is the corner this pool starts from, so they are already standing
+     -- there rather than being routed across town to reach it.
+     AND dp.current_service_point_id = $1::uuid
+     AND EXISTS (SELECT 1 FROM pool_members pm WHERE pm.ride_pool_id = rp.id)
+     -- And every member already aboard started from that same corner. Checked
+     -- against the members' own requests rather than the pool's geometry, because
+     -- the rule is about the journeys, not about where a line happens to run.
+     AND NOT EXISTS (
+           SELECT 1
+             FROM pool_members pm
+             JOIN ride_requests rr ON rr.id = pm.ride_request_id
+            WHERE pm.ride_pool_id = rp.id
+              AND rr.pickup_service_point_id <> $1::uuid
+         )
      AND (SELECT count(*)::int FROM pool_members pm WHERE pm.ride_pool_id = rp.id)
          < rp.capacity_snapshot
      AND NOT EXISTS (
-           SELECT 1 FROM pool_members mine WHERE mine.ride_request_id = $5::uuid
+           SELECT 1 FROM pool_members mine WHERE mine.ride_request_id = $2::uuid
          )
      AND NOT EXISTS (
            SELECT 1 FROM dispatch_offers pending
@@ -132,31 +141,23 @@ const CANDIDATE_POOLS_SQL = `
          )
      AND NOT EXISTS (
            SELECT 1 FROM dispatch_offers spent
-            WHERE spent.ride_request_id = $5::uuid
+            WHERE spent.ride_request_id = $2::uuid
               AND spent.driver_profile_id = rp.driver_profile_id
               AND spent.offer_type = 'ADD_PASSENGER'
               AND spent.status IN ('REJECTED', 'EXPIRED')
          )
-   ORDER BY pickup_distance_meters ASC, rp.created_at ASC, rp.id ASC
-   LIMIT $6::int`;
+   ORDER BY rp.created_at ASC, rp.id ASC
+   LIMIT $3::int`;
 
 export const findCandidatePools = async ({
   pickupServicePointId,
+  // Accepted and deliberately unused: the destination no longer shortlists pools.
+  // Reachability between the two drop-offs is decided per insertion, by the router.
   dropoffServicePointId,
   rideRequestId,
-  radiusMeters,
-  destinationRadiusMeters = env.matching.destinationRadiusMeters,
   limit = env.matching.maxCandidatePools,
 }) =>
-  prisma.$queryRawUnsafe(
-    CANDIDATE_POOLS_SQL,
-    pickupServicePointId,
-    dropoffServicePointId,
-    radiusMeters ?? env.matching.radiusMeters,
-    destinationRadiusMeters ?? null,
-    rideRequestId,
-    limit,
-  );
+  prisma.$queryRawUnsafe(CANDIDATE_POOLS_SQL, pickupServicePointId, rideRequestId, limit);
 
 /**
  * A memoised leg lookup.
@@ -338,16 +339,7 @@ export const evaluatePool = async ({ candidate, request, poolStops, baselines, p
       planningAt: now,
     });
 
-    const verdict = validatePlan({
-      occupancy,
-      metrics,
-      limits: {
-        maxPickupWaitSeconds: env.matching.maxPickupWaitSeconds,
-        maxAddedPoolDurationSeconds: env.matching.maxAddedPoolDurationSeconds,
-        maxExistingPassengerDetourSeconds: env.matching.maxExistingPassengerDetourSeconds,
-        maxExistingPassengerDetourRatio: env.matching.maxExistingPassengerDetourRatio,
-      },
-    });
+    const verdict = validatePlan({ occupancy });
 
     if (!verdict.valid) {
       const key = verdict.detail ? `${verdict.reason}:${verdict.detail}` : verdict.reason;

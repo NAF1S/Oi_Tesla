@@ -140,7 +140,9 @@ const requestRide = async (passenger, { origin = POINTS.PICKUP, destination = PO
 const createInitialPool = async ({
   driver,
   passenger,
-  point = POINTS.NEAR,
+  // The driver stands at the pickup: under the v2 matching rule a pool can only
+  // take another passenger if its driver is already on the shared start point.
+  point = POINTS.PICKUP,
   quotePricing = null,
 }) => {
   await goOnline(driver, point);

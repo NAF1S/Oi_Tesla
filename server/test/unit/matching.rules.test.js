@@ -132,7 +132,7 @@ const evaluateProposal = (positions) => {
   const metrics = measureStops(stops);
   const occupancy = simulateOccupancy({ stops, capacity: CAPACITY });
   const scoring = scorePlan({ metrics, weights: WEIGHTS });
-  const validation = validatePlan({ occupancy, metrics, limits: LIMITS });
+  const validation = validatePlan({ occupancy });
 
   return { positions, stops, metrics, occupancy, scoring, validation };
 };
@@ -608,118 +608,49 @@ describe('simulateOccupancy', () => {
   });
 });
 
-// --- Categories 21-23: waiting and detour limits -------------------------
+// --- Categories 21-23: the v2 eligibility rule ---------------------------
 
+/**
+ * Two of the three conditions are decided before a plan is ever measured: the
+ * shared starting point is a candidate-query filter, and reachability is an
+ * unroutable insertion refused upstream. So all that is left for this function is
+ * occupancy, and that is all it is asked about here.
+ */
 describe('validatePlan', () => {
-  const metricsWith = (overrides = {}) => ({
-    pickupWaitSeconds: 100,
-    addedDurationSeconds: 100,
-    worstDetourSeconds: 100,
-    passengerDurations: [
-      { rideRequestId: 'rr-A', poolMemberId: 'pm-A', detourSeconds: 100, detourRatio: 1.1 },
-    ],
-    ...overrides,
+  it('allows any measured plan the vehicle can hold', () => {
+    assert.deepStrictEqual(
+      validatePlan({ occupancy: { valid: true, peakOccupancy: 2 } }),
+      { valid: true },
+    );
   });
 
-  const allowed = (overrides) =>
-    validatePlan({
-      occupancy: { valid: true, peakOccupancy: 2 },
-      metrics: metricsWith(overrides),
-      limits: LIMITS,
-    });
-
-  it('allows a plan that breaks no limit', () => {
-    assert.deepStrictEqual(allowed(), { valid: true });
+  it('refuses a plan that breaks capacity, by name, and says which way (category 16)', () => {
+    assert.deepStrictEqual(
+      validatePlan({
+        occupancy: { valid: false, reason: PLAN_REJECTION.OCCUPANCY, detail: 'capacity_exceeded' },
+      }),
+      { valid: false, reason: PLAN_REJECTION.OCCUPANCY, detail: 'capacity_exceeded' },
+    );
   });
 
-  it('ignores a real plan whose insertion is legal but identical', () => {
-    const proposal = evaluateProposal({ pickupPosition: 1, dropoffPosition: 3 });
-
-    assert.deepStrictEqual(proposal.validation, { valid: true });
-    assert.strictEqual(proposal.scoring.score, 310);
-  });
-
-  it('refuses a passenger left waiting too long, by name (category 21)', () => {
-    assert.deepStrictEqual(allowed({ pickupWaitSeconds: LIMITS.maxPickupWaitSeconds + 1 }), {
-      valid: false,
-      reason: PLAN_REJECTION.PICKUP_WAIT,
-    });
-    // Exactly at the limit is inside it: the limits are inclusive.
-    assert.deepStrictEqual(allowed({ pickupWaitSeconds: LIMITS.maxPickupWaitSeconds }), {
-      valid: true,
-    });
-  });
-
-  it('refuses an insertion that adds too much driving (category 22)', () => {
-    assert.deepStrictEqual(allowed({ addedDurationSeconds: LIMITS.maxAddedPoolDurationSeconds + 1 }), {
-      valid: false,
-      reason: PLAN_REJECTION.ADDED_DURATION,
-    });
-    assert.deepStrictEqual(allowed({ addedDurationSeconds: LIMITS.maxAddedPoolDurationSeconds }), {
-      valid: true,
-    });
-  });
-
-  it('refuses a plan that delays an existing passenger too much in absolute terms (category 23)', () => {
-    assert.deepStrictEqual(allowed({ worstDetourSeconds: LIMITS.maxExistingPassengerDetourSeconds + 1 }), {
-      valid: false,
-      reason: PLAN_REJECTION.DETOUR,
-    });
-  });
-
-  it('refuses a plan that delays an existing passenger too much in proportion (category 23)', () => {
-    // 1300 seconds against a 1000 second baseline is a ratio of 1.3: still under
-    // the absolute limit, over the ratio one.
-    const result = allowed({
-      worstDetourSeconds: 300,
-      passengerDurations: [
-        { rideRequestId: 'rr-A', poolMemberId: 'pm-A', detourSeconds: 300, detourRatio: 1.3 },
-      ],
-    });
-
-    assert.deepStrictEqual(result, { valid: false, reason: PLAN_REJECTION.DETOUR_RATIO });
-  });
-
-  it('ratio-checks only the passengers who have a baseline', () => {
-    const result = allowed({
-      passengerDurations: [
-        { rideRequestId: 'rr-A', poolMemberId: 'pm-A', detourSeconds: 0, detourRatio: null },
-        { rideRequestId: 'rr-B', poolMemberId: 'pm-B', detourSeconds: 0, detourRatio: 1.05 },
-      ],
+  it('no longer consults waiting, added driving or detour at all', () => {
+    // An explicit statement of the redesign. A plan whose metrics would have
+    // failed every one of the old limits is allowed, because none of those limits
+    // is part of eligibility any more -- the shape of the two journeys is, and a
+    // plan that got this far already has the right shape.
+    const result = validatePlan({
+      occupancy: { valid: true, peakOccupancy: 3 },
+      metrics: {
+        pickupWaitSeconds: 100_000,
+        addedDurationSeconds: 100_000,
+        worstDetourSeconds: 100_000,
+        passengerDurations: [
+          { rideRequestId: 'rr-A', poolMemberId: 'pm-A', detourSeconds: 100_000, detourRatio: 99 },
+        ],
+      },
     });
 
     assert.deepStrictEqual(result, { valid: true });
-  });
-
-  it('reports an occupancy problem before any metric (category 16)', () => {
-    const result = validatePlan({
-      occupancy: { valid: false, reason: PLAN_REJECTION.OCCUPANCY, detail: 'capacity_exceeded' },
-      metrics: metricsWith({ pickupWaitSeconds: 100_000 }),
-      limits: LIMITS,
-    });
-
-    assert.deepStrictEqual(result, {
-      valid: false,
-      reason: PLAN_REJECTION.OCCUPANCY,
-      detail: 'capacity_exceeded',
-    });
-  });
-
-  it('names each limit that fires for a real insertion', () => {
-    const impossible = validatePlan({
-      occupancy: { valid: true, peakOccupancy: 2 },
-      metrics: {
-        pickupWaitSeconds: 5000,
-        addedDurationSeconds: 5000,
-        worstDetourSeconds: 5000,
-        passengerDurations: [
-          { rideRequestId: 'rr-A', poolMemberId: 'pm-A', detourSeconds: 4000, detourRatio: 5 },
-        ],
-      },
-      limits: LIMITS,
-    });
-
-    assert.deepStrictEqual(impossible, { valid: false, reason: PLAN_REJECTION.PICKUP_WAIT });
   });
 });
 
@@ -755,17 +686,15 @@ describe('every valid insertion of the demo corridor', () => {
     );
   });
 
-  it('rejects exactly the plans that break a limit, and says which (categories 21, 22)', () => {
-    const rejections = proposals
-      .filter((proposal) => !proposal.validation.valid)
-      .map((proposal) => proposal.validation.reason);
+  it('rejects none of them: the rule no longer consults waiting or driving (categories 21, 22)', () => {
+    // Two of these six plans drive the whole corridor twice, and one collects the
+    // new passenger only after A has been delivered -- all of which the old limits
+    // refused by name. Under the v2 rule the only thing that can refuse a plan is
+    // occupancy, and none of these overfills a two-seat car, so all six are
+    // allowed and the score is what chooses between them.
+    const rejected = proposals.filter((proposal) => !proposal.validation.valid);
 
-    // Driving the whole corridor twice, and fetching the new passenger only
-    // after A has been delivered.
-    assert.deepStrictEqual(rejections.sort(), [
-      PLAN_REJECTION.ADDED_DURATION,
-      PLAN_REJECTION.PICKUP_WAIT,
-    ].sort());
+    assert.deepStrictEqual(rejected, []);
   });
 
   it('picks the cheapest plan and breaks ties deterministically (category 25)', () => {

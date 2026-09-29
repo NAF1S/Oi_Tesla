@@ -320,6 +320,12 @@ export const LOCATION_EDGES = [
   { from: 'tejgaon-link-road', to: 'mohakhali-bus-terminal' },
   { from: 'mohakhali-bus-terminal', to: 'banani-road-11', fareWeight: 1.5 },
   { from: 'banani-road-11', to: 'gulshan-1-circle' },
+  // Gulshan 1 Circle and Mohakhali Bus Terminal are both a short hop from Banani
+  // and only a hop and a half from each other, but without this link the only
+  // road between them runs back up Banani Road 11 -- 4.0 km to cover the 1.7 km
+  // that actually separates them. A car pooling two passengers at Banani, one for
+  // each, would spend that 4.0 km retracing its own route.
+  { from: 'gulshan-1-circle', to: 'mohakhali-bus-terminal', fareWeight: 1.5 },
   { from: 'gulshan-1-circle', to: 'badda-link-road' },
   { from: 'badda-link-road', to: 'bashundhara-gate' },
   { from: 'bashundhara-gate', to: 'house-building' },

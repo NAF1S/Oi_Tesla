@@ -77,7 +77,7 @@ or a partial unique index stands behind it — not just a service-level check.
 
 **Place, distance and price**
 - 15 zones and 45 service points seeded from a Dhaka transport graph, anchored to a routing
-  graph of 45 vertices and 46 edges — including 4 one-way streets.
+  graph of 45 vertices and 47 edges — including 4 one-way streets.
 - `POST /routes/estimate` — pgRouting Dijkstra over directed edges, with rush-hour and normal
   traffic profiles chosen from configurable windows.
 - Versioned fare policies and immutable, auditable quotes with a full breakdown. Money is exact
@@ -1200,7 +1200,7 @@ npm run db:seed      # apply the demo zones, points and routing graph (idempoten
 npm test             # unit + integration tests
 ```
 
-After seeding you get **15 service zones, 45 service points, 45 routing vertices and 46 routing edges** (42 bidirectional, 4 one-way).
+After seeding you get **15 service zones, 45 service points, 45 routing vertices and 47 routing edges** (43 bidirectional, 4 one-way).
 
 > **Every coordinate is approximate demo data, not verified navigation data.** The MVP deliberately has no maps, geocoding, routing APIs or live traffic. `server/src/db/seeds/location.data.js` holds hand-written, neighbourhood-level coordinates for each named Dhaka location, and each edge is a straight two-point LineString between the coordinates it connects -- plausible for a demo, not a road centreline. Edit that one file to review or change any of it, then re-run `npm run db:seed`.
 
@@ -2178,9 +2178,62 @@ Stage one is one query. The new pickup -- and optionally the new destination -- 
 ST_DWithin(pickup.location, rp.planned_route_geometry::geography, $3::float8)
 ```
 
-`ride_pools_planned_route_geometry_idx` (GiST) makes it a spatial lookup, and two managed indexes keep the rest of the filter cheap: `ride_pools_forming_idx` and the partial `one_pending_route_change_offer_per_pool`. The radius is configuration (`MATCHING_RADIUS_METERS`, default **1500 m**), and so is the candidate limit (`MATCHING_MAX_CANDIDATE_POOLS`, default **10**; nearest-first, with `created_at` and `id` breaking ties so the list is reproducible).
+`ride_pools_planned_route_geometry_idx` (GiST) makes it a spatial lookup, and two managed indexes keep the rest of the filter cheap: `ride_pools_forming_idx` and the partial `one_pending_route_change_offer_per_pool`. The radius is configuration (`MATCHING_RADIUS_METERS`, default **2500 m**), and so is the candidate limit (`MATCHING_MAX_CANDIDATE_POOLS`, default **10**; nearest-first, with `created_at` and `id` breaking ties so the list is reproducible).
+
+The radius is set to the spacing of the seeded zones rather than to a tight corridor, and that is deliberate: it buys *candidates*, not matches. The seeded Banani Road 11 and Mohakhali Bus Terminal points are 1.6 km apart, so at the original 1500 m the pool was discarded before any rule about waiting or detours was consulted -- the passenger a zone off the route, who is exactly who pooling is for, was the one the shortlist silently dropped.
 
 Proximity is a **shortlist and nothing more**. A pool metres from the pickup is still refused if no insertion of the new stops can satisfy the waiting, duration and detour rules -- the tests assert both halves of that.
+
+**A worked example — two pickups, one car.** Nusrat asks from **Banani Road 11** to Gulshan 1 Circle, and Jashim accepts; the pool is `FORMING`. Rafiq then asks from the **Mohakhali Bus Terminal** to the same circle. The two pickups are 1.6 km apart, but this is one journey rather than two, so the car runs:
+
+```text
+1:PICKUP   mohakhali-bus-terminal
+2:PICKUP   banani-road-11
+3:DROPOFF  gulshan-1-circle
+4:DROPOFF  gulshan-1-circle
+```
+
+Two things are worth noticing, and both are consequences of the rules rather than of a special case:
+
+* **Nusrat's own ride does not change.** She boards at stop 2 and alights at stop 3, which is exactly the solo journey she was quoted -- the ratio check sees a detour of 1.0. What the join costs her is *waiting*, not distance, because the car reaches Mohakhali first. That is the trade the wait limit exists to bound.
+* **The second passenger does not increase the first one's fare.** Both are repriced from the legs they were aboard, each capped by their own solo quote and by what they were already paying.
+
+Two cars would have driven the same corridor. One does, and the bill is shared -- see [Shared fares](#shared-fares).
+
+**The same corner, and the last seat.** Three passengers all waiting at **Banani Road 11** -- Nusrat to Gulshan 1 Circle, Rafiq to Gulshan 2 Circle, Shirin back to Gulshan 1 Circle -- fill a three-seat car:
+
+```text
+1:PICKUP   banani-road-11     Nusrat
+2:PICKUP   banani-road-11     Rafiq
+3:PICKUP   banani-road-11     Shirin
+4:DROPOFF  gulshan-1-circle
+5:DROPOFF  gulshan-1-circle
+6:DROPOFF  gulshan-2-circle
+```
+
+Every stop after the third is somewhere the car was already going, so the joins add almost no driving, and all three are billed a share bounded by their own solo quote. The third is the last one there is: `capacity_snapshot` is 3, and the candidate query filters on `member_count < capacity_snapshot`, so a fourth request finds no pool rather than being turned away later.
+
+**Two destinations either side of one corner.** The case the demo is built around: Nusrat is going from Banani Road 11 to Gulshan 1 Circle and Rafiq from Banani Road 11 to Mohakhali Bus Terminal. They are in *different* directions, so one car serving both has to drop one of them first and then come back past the corner -- and that is exactly what it does:
+
+```text
+1:PICKUP   banani-road-11
+2:PICKUP   banani-road-11
+3:DROPOFF  gulshan-1-circle
+4:DROPOFF  mohakhali-bus-terminal
+```
+
+| | Distance | Duration |
+| --- | --- | --- |
+| Banani Road 11 → Gulshan 1 Circle | 1812 m | 466 s |
+| Banani Road 11 → Mohakhali Bus Terminal | 2214 m | 569 s |
+| Gulshan 1 Circle → Mohakhali Bus Terminal | 1654 m | 425 s |
+
+Two things had to be true for this to be allowed, and both are deliberate:
+
+* **The two destinations needed a road between them.** They are 1.7 km apart, but nothing in the seed joined them, so the router sent the car 4026 m back up Banani Road 11 to cover the gap. That was an artefact of a sparse teaching graph, not a fact about Dhaka, and it is why `location.data.js` now carries a Gulshan 1 Circle ↔ Mohakhali Bus Terminal edge.
+* **The detour ratio had to allow ~1.6×.** Whoever is set down second rides past their own stop and comes back, so their journey is about 1.6× the solo quote they accepted. That is what serving two destinations either side of one pickup honestly costs, and the limit is set to 1.75 for it. It is the loosest of the matching limits on purpose and the one to tighten first if you want a more conservative product -- see the notes on `MATCHING_MAX_DETOUR_RATIO` in `server/.env.example`.
+
+The fare is where the passenger is protected instead. Both are repriced from the legs they were aboard, each capped by their own solo quote and by what they were already paying, so the passenger who rides further still never pays more than they agreed to.
 
 ### Stop insertion
 

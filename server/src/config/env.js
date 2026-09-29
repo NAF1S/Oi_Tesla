@@ -183,8 +183,16 @@ export const env = {
      * Stage 1 of pool matching: how near a new pickup has to be to a pool's
      * planned route to be worth simulating. Straight-line metres, used only to
      * shortlist -- the insertion simulation decides.
+     *
+     * It is a *filter for cost*, not a safety rule, so it is set to the spacing
+     * of the seeded zones rather than to a tight corridor: a passenger one zone
+     * off a pool's route is exactly who pooling is for, and at 1500 m the
+     * Banani Road 11 <-> Mohakhali pair was excluded before any detour rule got
+     * to judge it. Everything that actually protects a passenger -- the wait,
+     * the added duration and the two detour limits -- is applied afterwards, to
+     * the plans this shortlist admits.
      */
-    radiusMeters: toNumber(process.env.MATCHING_RADIUS_METERS, 1500),
+    radiusMeters: toNumber(process.env.MATCHING_RADIUS_METERS, 2500),
     /** How near the new destination has to be to the pool's route. */
     destinationRadiusMeters: toNumber(process.env.MATCHING_DESTINATION_RADIUS_METERS, 3000),
     /**
@@ -199,8 +207,18 @@ export const env = {
     maxExistingPassengerDetourSeconds: toNumber(
       process.env.MATCHING_MAX_DETOUR_SECONDS,
       600,
-    ),
-    maxExistingPassengerDetourRatio: toNumber(process.env.MATCHING_MAX_DETOUR_RATIO, 1.25),
+    ),    /**
+     * The multiple of their own accepted journey a passenger may be asked to
+     * travel instead -- "never more than 75% longer than you agreed to".
+     *
+     * DEMO TUNING, and the loosest of these limits on purpose. It is what decides
+     * whether two passengers leaving the same corner for two places a couple of
+     * kilometres away share a car: serving both means one of them rides past their
+     * own destination and comes back, so the honest number for that kind of pair
+     * is around 1.6, not 1.25. Set it to 1.25 for a stricter, more obviously
+     * conservative product; the fare caps still guarantee nobody pays more, which
+     * is the part that protects a passenger's wallet rather than their time.
+     */    maxExistingPassengerDetourRatio: toNumber(process.env.MATCHING_MAX_DETOUR_RATIO, 1.75),
     /**
      * How much a second of pick-up wait and a second of somebody else's detour
      * are worth against a second of extra driving. All ones by default, which

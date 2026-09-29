@@ -5,10 +5,23 @@ Two things per seeder: a `*.data.js` holding the values as plain data, and a
 
 | Pair | Loads |
 | ---- | ----- |
-| `location.data.js` / `location.seed.js` | 15 zones, 45 service points, 45 routing vertices, 46 routing edges (42 bidirectional, 4 one-way) |
+| `location.data.js` / `location.seed.js` | 15 zones, 45 service points, 45 routing vertices, 47 routing edges (43 bidirectional, 4 one-way) |
 | `auth.data.js` / `auth.seed.js` | The four demo accounts and Jashim's `Bullet` vehicle |
 
 `fare.data.js` holds the `dhaka-solo` v1 pricing policy, applied by `fare.seed.js`.
+
+> **Adding or removing an edge needs the graph rebuilt.** `graph_edge_id` is that
+> edge code's rank in byte order (`graph-ids.js`), and it is immutable in the
+> database — a trigger rejects the update, because a stored route is a list of edge
+> ids. So a new edge takes a rank some existing edge already holds. On an existing
+> database, clear the edges first and let the seeder re-insert the whole set:
+>
+> ```sql
+> DELETE FROM routing_edges;   -- then: npm run db:seed
+> ```
+>
+> A database seeded from scratch needs none of this. Adding a *vertex* is the same
+> story with `routing_vertices`.
 
 ## Why it matters
 

@@ -37,6 +37,15 @@ them for the client.
    `pool_stops_lifecycle_consistent`, `pool_members_lifecycle_consistent`,
    `ride_requests_lifecycle_consistent`). A fixture that writes a status by hand
    must write the timestamp too.
+7. **A convergence section must not contradict a later file.** Every file re-runs
+   on every `db:migrate`, so a section that re-adds a *superseded* definition is
+   applied to data written under the newer one -- and fails, on the second run,
+   in the one place nobody looks. This was real: §9 of `11-pool-fares.sql`
+   re-adds `pool_fare_calculations_totals_consistent` without the rounding term
+   that `14-fare-rounding.sql` adds, so it rejected every pooled fare carrying a
+   non-zero adjustment. It is now guarded on that column not existing yet. Either
+   a re-add is still the newest definition, or it is conditional on the newer one
+   being absent.
 
 ## What is here
 
@@ -53,6 +62,8 @@ them for the client.
 | `10-pool-matching.sql` | Join offers, the pool-version guard, the candidate indexes |
 | `11-pool-fares.sql` | `pool_fare_calculations` / `_legs` / allocations / shares |
 | `12-driver-trip.sql` | `departed_at`, `pool_stops.completed_at`, the request's own start and completion, the trip's event values |
+| `13-read-api.sql` | Read-path indexes only (the passenger/driver history and current-pool lookups) |
+| `14-fare-rounding.sql` | `fare_rounding_unit` / `fare_rounding_adjustment` on quotes, allocations and calculations, and the widened totals constraint |
 
 ## Depends on / depended on by
 

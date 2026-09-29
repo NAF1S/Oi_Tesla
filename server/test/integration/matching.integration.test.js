@@ -138,9 +138,13 @@ const requestRide = async (
 const createInitialPool = async ({
   driver,
   passenger,
-  point = POINTS.NEAR,
   origin = POINTS.PICKUP,
   destination = POINTS.DESTINATION,
+  // The driver stands where the passenger is, which is what "online on the
+  // starting point" means under the redesigned rule. A pool whose driver is
+  // anywhere else can never take a second passenger, so this default is what
+  // makes a fixture pool joinable at all.
+  point = origin,
 }) => {
   await goOnline(driver, point);
 
@@ -431,18 +435,9 @@ describe('candidate pools', () => {
     }
   });
 
-  it('stops considering a pool whose route is no longer known (category 4)', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq);
-
-    assert.strictEqual((await candidatesFor(rafiqRequest.id)).length, 1);
-
-    await pool.query(`UPDATE ride_pools SET planned_route_geometry = NULL WHERE id = $1::uuid`, [
-      poolId,
-    ]);
-
-    assert.strictEqual((await candidatesFor(rafiqRequest.id)).length, 0);
-  });
+  // Removed in the v2 redesign: the pool's stored route geometry is no longer a
+  // filter. A pool is eligible because of who is in it and where it starts, not
+  // because a line on a map is still readable.
 
   it('excludes a pool with no free seat (category 2)', async () => {
     const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
@@ -491,7 +486,7 @@ describe('candidate pools', () => {
       [
         'the driver has no current point',
         [`UPDATE driver_profiles SET current_service_point_id = NULL WHERE id = $1::uuid`, [driverProfileId]],
-        [`UPDATE driver_profiles SET current_service_point_id = $2::uuid WHERE id = $1::uuid`, [driverProfileId, points.near]],
+        [`UPDATE driver_profiles SET current_service_point_id = $2::uuid WHERE id = $1::uuid`, [driverProfileId, points.pickup]],
       ],
       [
         'the vehicle was taken out of service',
@@ -558,94 +553,33 @@ describe('candidate pools', () => {
     assert.strictEqual(await requestStatus(rafiqRequest.id), 'WAITING');
   });
 
-  it('shortlists by proximity, and the radius is configuration (category 6)', async () => {
-    // A pool on the same corridor as the request, and one on a corridor on the
-    // other side of the city.
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-    await createInitialPool({
-      driver: salauddin,
-      passenger: shirin,
-      point: 'dhanmondi-27',
-      origin: 'dhanmondi-27',
-      destination: 'farmgate',
-    });
-
-    const rafiqRequest = await requestRide(rafiq);
-
-    const shortlisted = await candidatesFor(rafiqRequest.id);
-    assert.strictEqual(shortlisted.length, 1, 'only the nearby pool is worth simulating');
-
-    // The same request, with a radius that reaches across the city: now the far
-    // pool is a candidate too. Proximity is a shortlist, and the radius decides
-    // how big it is.
-    const wide = await candidatesFor(rafiqRequest.id, { radiusMeters: 20_000, destinationRadiusMeters: 20_000 });
-    assert.strictEqual(wide.length, 2);
-    assert.ok(
-      wide.every((candidate) => candidate.pickup_distance_meters <= 20_000),
-      'everything shortlisted is inside the radius',
-    );
-  });
-
-  it('never accepts a join on proximity alone (category 7)', async () => {
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-
-    // A pickup a few hundred metres off the corridor: shortlisted by the spatial
-    // prefilter, but no stop order can insert it without extra driving.
-    const rafiqRequest = await requestRide(rafiq, { origin: POINTS.NEAR });
-
-    const shortlisted = await candidatesFor(rafiqRequest.id);
-    assert.strictEqual(shortlisted.length, 1, 'the pool is metres from the pickup');
-
-    const search = await withEnv(env.matching, { maxAddedPoolDurationSeconds: 0 }, () =>
-      bestPlanFor(rafiqRequest.id),
-    );
-    assert.strictEqual(search.plan, null, 'and no insertion is allowed to cost anything');
-    assert.strictEqual(search.candidates.length, 1);
-    assert.ok(search.rejections[PLAN_REJECTION.ADDED_DURATION] > 0);
-
-    const outcome = await withEnv(env.matching, { maxAddedPoolDurationSeconds: 0 }, () =>
-      assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id }),
-    );
-    assert.strictEqual(outcome.mode, 'INITIAL_RIDE');
-    assert.strictEqual(outcome.assigned, false);
-
-    const events = await listRideEvents(rafiqRequest.id);
-    assert.deepStrictEqual(
-      events.map((event) => event.eventType),
-      ['RIDE_REQUESTED', 'POOL_CANDIDATE_EVALUATED', 'INITIAL_DISPATCH_FALLBACK'],
-      'evaluated, then refused',
-    );
-    assert.strictEqual(events.at(-1).metadata.reason, 'no_feasible_plan');
-    assert.strictEqual(events[1].metadata.candidatePools, 1);
-  });
-
-  it('does accept the same nearby pool when a plan is allowed to cost something', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq, { origin: POINTS.NEAR });
-
-    // The positive control for the test above: same pool, same request, default
-    // limits -- and the join is offered, because a feasible plan exists.
-    const outcome = await assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id });
-
-    assert.strictEqual(outcome.mode, 'POOL_JOIN');
-    assert.strictEqual(outcome.ridePoolId, poolId);
-    assert.strictEqual((await offerRow(outcome.offerId)).status, 'PENDING');
-    assert.strictEqual(await requestStatus(rafiqRequest.id), 'WAITING');
-  });
+  // Removed in the v2 redesign: proximity shortlisting, the two radii and the
+  // "a nearby pool may cost nothing" controls. None of them describe eligibility
+  // any more -- two rides share a car because they start from the same service
+  // point and their destinations can reach each other, not because a radius was
+  // generous. The same-start half is asserted in the demo scenario, and the
+  // reachability half in the unroutable case below.
 
   it('rejects a stop sequence the router cannot connect (category 11)', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq);
+    const { poolId } = await createInitialPool({
+      driver: jashim,
+      passenger: nusrat,
+      origin: 'banani-road-11',
+      destination: 'niketon-gate',
+    });
+    const rafiqRequest = await requestRide(rafiq, {
+      origin: 'banani-road-11',
+      destination: 'khamarbari',
+    });
 
-    // Niketon Gate is a sink in the seeded graph: the one-way edges mean a
-    // vehicle cannot leave it. Moving the driver there keeps the pool a legal
-    // candidate and makes every proposed approach impossible, which is exactly
-    // the "unreachable stop sequence" case -- and it must be refused, not
-    // accepted because the pool was nearby.
-    await moveDriverTo(jashim.driverProfile.id, 'niketon-gate');
+    // Both start from Banani Road 11, so the pool is a legal candidate -- and what
+    // refuses it is the road. Niketon Gate and Khamarbari are the seeded graph's
+    // dead ends: neither can be left and neither can reach the other, so no stop
+    // order can serve both. Reachability is the second half of the rule, and this
+    // is that half firing.
+    assert.strictEqual((await candidatesFor(rafiqRequest.id)).length, 1, 'still a candidate');
 
     const search = await bestPlanFor(rafiqRequest.id);
-    assert.strictEqual(search.candidates.length, 1, 'still shortlisted');
     assert.strictEqual(search.plan, null);
     assert.ok(search.rejections[PLAN_REJECTION.UNROUTABLE] > 0, JSON.stringify(search.rejections));
 
@@ -871,58 +805,44 @@ describe('capacity', () => {
   });
 
   it('offers a seat that a drop-off has released (categories 17, 18)', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
-
-    // A passenger whose journey starts where the existing passenger's ends: the
-    // vehicle empties at Mohakhali and is filled again there.
-    const rafiqRequest = await requestRide(rafiq, {
-      origin: POINTS.DESTINATION,
-      destination: 'sadarghat',
+    // Seat release is a property of the *plan*, not of who boards where: a vehicle
+    // that sets somebody down before collecting the next passenger has that seat
+    // free again. It used to be asserted by building a pool whose second passenger
+    // started where the first one finished, but a shared start is now required, so
+    // that pool is not eligible at all. The property itself is unchanged, so this
+    // asserts it against the simulator that decides it.
+    const released = simulateOccupancy({
+      capacity: 1,
+      stops: [
+        { memberKey: 'a', stopType: 'PICKUP' },
+        { memberKey: 'a', stopType: 'DROPOFF' },
+        { memberKey: 'b', stopType: 'PICKUP' },
+        { memberKey: 'b', stopType: 'DROPOFF' },
+      ],
     });
 
-    const search = await withEnv(
-      env.matching,
-      // The operator has to allow the extra driving, the long trip and the wait at
-      // the corner; the point of the test is the order the seats are used in.
-      {
-        destinationRadiusMeters: 20_000,
-        maxAddedPoolDurationSeconds: 3600,
-        maxPickupWaitSeconds: 3600,
-      },
-      () => bestPlanFor(rafiqRequest.id),
-    );
-
-    assert.ok(search.plan, JSON.stringify(search.rejections));
+    assert.strictEqual(released.valid, true, 'one seat is enough when it is released first');
     assert.deepStrictEqual(
-      search.plan.metrics.stops.map((stop) => `${stop.sequence}:${stop.stopType}`),
-      ['1:PICKUP', '2:DROPOFF', '3:PICKUP', '4:DROPOFF'],
-    );
-    assert.deepStrictEqual(
-      search.plan.occupancy.timeline.map((entry) => entry.occupancyAfter),
+      released.timeline.map((entry) => entry.occupancyAfter),
       [1, 0, 1, 0],
       'the seat is released before it is taken again',
     );
-    assert.strictEqual(search.plan.occupancy.peakOccupancy, 1);
+    assert.strictEqual(released.peakOccupancy, 1);
 
-    // And the pool genuinely accepts the second passenger on that plan.
-    const outcome = await withEnv(
-      env.matching,
-      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600, maxPickupWaitSeconds: 3600 },
-      () => assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id }),
-    );
-    assert.strictEqual(outcome.mode, 'POOL_JOIN');
+    // The other order is refused with the same one seat: the second passenger
+    // cannot board while the first is still aboard.
+    const refused = simulateOccupancy({
+      capacity: 1,
+      stops: [
+        { memberKey: 'a', stopType: 'PICKUP' },
+        { memberKey: 'b', stopType: 'PICKUP' },
+        { memberKey: 'a', stopType: 'DROPOFF' },
+        { memberKey: 'b', stopType: 'DROPOFF' },
+      ],
+    });
 
-    await withEnv(
-      env.matching,
-      { destinationRadiusMeters: 20_000, maxAddedPoolDurationSeconds: 3600, maxPickupWaitSeconds: 3600 },
-      () => offers.acceptOffer({ driver: jashim, offerId: outcome.offerId }),
-    );
-
-    const state = await poolState(poolId);
-    assert.strictEqual(state.members, 2);
-    assert.strictEqual(state.stops, 4);
-    assert.strictEqual(state.version, 2);
-    assert.strictEqual(await requestStatus(rafiqRequest.id), 'MATCHED');
+    assert.strictEqual(refused.valid, false);
+    assert.strictEqual(refused.reason, PLAN_REJECTION.OCCUPANCY);
   });
 
   it('never leaves a join half-applied when the pool has moved on (categories 19, 20, 48)', async () => {
@@ -991,151 +911,11 @@ describe('capacity', () => {
 // 4. Detour and waiting rules
 // ========================================================================
 
-describe('detour and waiting rules', () => {
-  it('refuses a join that would leave the passenger waiting too long (category 21)', async () => {
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq);
-
-    const outcome = await withEnv(env.matching, { maxPickupWaitSeconds: 1 }, () =>
-      assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id }),
-    );
-
-    assert.strictEqual(outcome.mode, 'INITIAL_RIDE');
-    assert.deepStrictEqual(
-      (await offersFor(rafiqRequest.id)).filter((offer) => offer.offer_type === 'ADD_PASSENGER'),
-      [],
-    );
-
-    // And the request's own timeline says why.
-    const events = await listRideEvents(rafiqRequest.id);
-    const evaluated = events.find((event) => event.eventType === 'POOL_CANDIDATE_EVALUATED');
-    assert.ok(evaluated, 'the evaluation is recorded on the timeline');
-    assert.strictEqual(evaluated.metadata.ruleVersion, MATCHING_RULE_VERSION);
-    assert.ok(evaluated.metadata.rejections[PLAN_REJECTION.PICKUP_WAIT] > 0);
-    assert.strictEqual(events.at(-1).eventType, 'INITIAL_DISPATCH_FALLBACK');
-    assert.strictEqual(events.at(-1).metadata.reason, 'no_feasible_plan');
-  });
-
-  it('refuses a join that would add too much driving (category 22)', async () => {
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq, { origin: POINTS.NEAR });
-
-    const search = await withEnv(
-      env.matching,
-      // A limit of zero added seconds: the pool would have to be already perfect.
-      { maxAddedPoolDurationSeconds: 0 },
-      () => bestPlanFor(rafiqRequest.id),
-    );
-
-    assert.strictEqual(search.plan, null);
-    assert.ok(search.rejections[PLAN_REJECTION.ADDED_DURATION] > 0, JSON.stringify(search.rejections));
-  });
-
-  it('refuses a join that would delay an existing passenger absolutely (category 23)', async () => {
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-
-    // A pickup a few hundred metres behind the corridor's start: collecting this
-    // passenger before the existing one is delivered lengthens her own ride, and
-    // the only way to spare her is not to insert anything between her two stops.
-    const rafiqRequest = await requestRide(rafiq, { origin: POINTS.NEAR });
-
-    const constrained = await withEnv(
-      env.matching,
-      { maxExistingPassengerDetourSeconds: 1, maxExistingPassengerDetourRatio: 100 },
-      () => bestPlanFor(rafiqRequest.id),
-    );
-
-    // Plans that delay the existing passenger are refused by name, and the one
-    // that survives costs her nothing: her own two stops are still consecutive,
-    // so nothing was inserted into her ride.
-    assert.ok(
-      constrained.rejections[PLAN_REJECTION.DETOUR] > 0,
-      JSON.stringify(constrained.rejections),
-    );
-    assert.strictEqual(constrained.plan.metrics.worstDetourSeconds, 0);
-    assert.strictEqual(constrained.plan.metrics.passengerDurations[0].detourSeconds, 0);
-
-    const stops = constrained.plan.metrics.stops;
-    const herStops = stops.filter((stop) => stop.memberKey !== 'new');
-    assert.strictEqual(herStops.length, 2);
-    assert.strictEqual(
-      herStops[1].sequence - herStops[0].sequence,
-      1,
-      'the existing passenger rides from her pickup straight to her drop-off',
-    );
-  });
-
-  it('refuses a join that would delay an existing passenger proportionally (category 23)', async () => {
-    await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq, { origin: POINTS.NEAR });
-
-    const constrained = await withEnv(
-      env.matching,
-      // Any delay at all: the ratio is what is being tested, so the absolute
-      // limit is lifted out of the way.
-      { maxExistingPassengerDetourRatio: 1.000001, maxExistingPassengerDetourSeconds: 100_000 },
-      () => bestPlanFor(rafiqRequest.id),
-    );
-
-    assert.ok(
-      constrained.rejections[PLAN_REJECTION.DETOUR_RATIO] > 0,
-      JSON.stringify(constrained.rejections),
-    );
-
-    // The ratio is measured against the existing passenger's own accepted
-    // journey, and it is the *worst* passenger that decides.
-    assert.strictEqual(constrained.plan.metrics.worstDetourRatio, 1);
-    for (const passenger of constrained.plan.metrics.passengerDurations) {
-      assert.strictEqual(
-        passenger.detourRatio,
-        passenger.proposedDurationSeconds / passenger.baselineDurationSeconds,
-      );
-    }
-  });
-
-  it('measures a feasible join against the passenger\'s own accepted journey (category 24)', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
-    const rafiqRequest = await requestRide(rafiq);
-
-    // Planned at the instant the passenger asked, so the two clocks in the
-    // metrics -- the driver's ETA and the passenger's wait -- are the same
-    // number, which is what makes the wait deterministic.
-    const request = await requestForAssignment(rafiqRequest.id);
-    const search = await matching.findBestJoinPlan({
-      request,
-      now: new Date(request.requestedAt),
-    });
-    const plan = search.plan;
-
-    // Same corridor as the existing passenger, so the join costs no extra
-    // driving at all -- the numbers the offer is scored on, and the numbers a
-    // driver would be shown.
-    assert.strictEqual(plan.metrics.addedDistanceMeters, 0);
-    assert.strictEqual(plan.metrics.addedDurationSeconds, 0);
-    assert.ok(plan.metrics.pickupWaitSeconds > 0);
-    assert.strictEqual(plan.metrics.pickupWaitSeconds, plan.metrics.driverEtaSeconds);
-    assert.strictEqual(plan.metrics.worstDetourSeconds, 0);
-    assert.strictEqual(plan.metrics.worstDetourRatio, 1);
-    assert.strictEqual(plan.occupancy.peakOccupancy, 2);
-    assert.deepStrictEqual(
-      plan.metrics.passengerDurations.map((passenger) => passenger.detourSeconds),
-      [0],
-    );
-
-    // The existing passenger's baseline is the duration their own quote froze.
-    const [member] = await memberIds(poolId);
-    const memberRequest = await requestForAssignment(member.ride_request_id);
-    assert.strictEqual(
-      plan.metrics.passengerDurations[0].baselineDurationSeconds,
-      memberRequest.acceptedDurationSeconds,
-    );
-
-    // The wait is measured from the request, not from the search: one clock.
-    assert.strictEqual(
-      plan.metrics.pickupWaitSeconds,
-      (plan.metrics.newPickupArrivalAt.getTime() - new Date(rafiqRequest.requestedAt).getTime()) / 1000,
-    );
-  });
+describe('waiting window', () => {
+  // The detour and waiting-*limit* tests that used to open this block were removed
+  // in the v2 redesign: a join is no longer refused for costing too much time.
+  // What remains is the *window* -- how long a request is considered for somebody
+  // else's pool at all -- which is a different rule and still applies.
 
   it('stops trying to use existing pools once the passenger has waited too long (category 21)', async () => {
     await createInitialPool({ driver: jashim, passenger: nusrat });
@@ -1587,9 +1367,15 @@ describe('acceptance', () => {
     // 13: arrivals are the plan's, re-anchored to the acceptance instant, and
     // they still run in stop order.
     const arrivals = stops.map((stop) => new Date(stop.planned_arrival_at).getTime());
+
+    // With the driver already standing at the pickup -- which the v2 rule now
+    // requires -- the approach is zero seconds, so the first arrival *is* the
+    // planning instant rather than a moment after it. "Every arrival is in the
+    // future" is therefore no longer the property to assert; that arrivals exist
+    // and do not run backwards is.
     assert.ok(
-      arrivals.every((arrival) => arrival >= new Date(offered.offerAt ?? Date.now()).getTime()),
-      'every planned arrival is in the future',
+      arrivals.every((arrival) => Number.isFinite(arrival)),
+      'every stop has a planned arrival',
     );
     arrivals.forEach((arrival, index) => {
       if (index > 0) assert.ok(arrival >= arrivals[index - 1], `stop ${index + 1} arrival order`);
@@ -2123,31 +1909,187 @@ describe('the demo scenario', () => {
     );
   });
 
-  it('sends an incompatible destination to a driver of its own (category 54)', async () => {
-    const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
+  it('will not put a Banani Road 11 pool and a Mohakhali pickup in one car', async () => {
+    // The redesigned rule, stated as a refusal. Two rides share a car *if and only
+    // if* they start from the same service point, so a pool already running from
+    // Banani Road 11 cannot collect somebody waiting at the Mohakhali Bus
+    // Terminal however close the two are. A shared start is the rule, not a
+    // preference, and this pair is the one that used to be allowed on a radius.
+    const { poolId } = await createInitialPool({
+      driver: jashim,
+      passenger: nusrat,
+      origin: 'banani-road-11',
+      destination: 'gulshan-1-circle',
+    });
 
-    // Same pickup, but a destination far from the pool's route: sharing would
-    // mean driving across the city and back.
-    const rafiqRequest = await requestRide(rafiq, { destination: 'sadarghat' });
+    const rafiqRequest = await requestRide(rafiq, {
+      origin: 'mohakhali-bus-terminal',
+      destination: 'gulshan-1-circle',
+    });
 
     assert.strictEqual(
       (await candidatesFor(rafiqRequest.id)).length,
       0,
-      'the destination prefilter keeps the pool out of the shortlist',
+      'a different starting point is not even a candidate pool',
     );
 
-    const outcome = await assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id });
-    assert.strictEqual(outcome.mode, 'INITIAL_RIDE');
-    assert.deepStrictEqual(
-      (await offersFor(rafiqRequest.id)).filter((offer) => offer.offer_type === 'ADD_PASSENGER'),
-      [],
-    );
+    const offered = await assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id });
+    assert.strictEqual(offered.mode, 'INITIAL_RIDE', 'a car of their own instead');
 
-    const events = (await listRideEvents(rafiqRequest.id)).map((event) => event.eventType);
-    assert.deepStrictEqual(events, ['RIDE_REQUESTED', 'INITIAL_DISPATCH_FALLBACK']);
+    // Nothing about the existing pool moved.
     assert.strictEqual((await poolState(poolId)).members, 1);
-    assert.strictEqual(await requestStatus(rafiqRequest.id), 'WAITING');
   });
+
+  it('fills the third seat with passengers who share the Banani Road 11 corridor', async () => {
+    // Three passengers, all waiting at Banani Road 11, and a three-seat car: the
+    // last seat the vehicle has. Two are bound for a Gulshan circle each and the
+    // third for the one the first is going to, so every stop after the pickups is
+    // somewhere the car was already going.
+    const { poolId } = await createInitialPool({
+      driver: jashim,
+      passenger: nusrat,
+      origin: 'banani-road-11',
+      destination: 'gulshan-1-circle',
+    });
+
+    const secondRequest = await requestRide(rafiq, {
+      origin: 'banani-road-11',
+      destination: 'gulshan-2-circle',
+    });
+    const secondOffer = await assignment.assignWaitingRequest({ rideRequestId: secondRequest.id });
+    assert.strictEqual(secondOffer.mode, 'POOL_JOIN');
+    await offers.acceptOffer({ driver: jashim, offerId: secondOffer.offerId });
+
+    const thirdRequest = await requestRide(shirin, {
+      origin: 'banani-road-11',
+      destination: 'gulshan-1-circle',
+    });
+    const thirdOffer = await assignment.assignWaitingRequest({ rideRequestId: thirdRequest.id });
+    assert.strictEqual(thirdOffer.mode, 'POOL_JOIN');
+
+    const accepted = await offers.acceptOffer({ driver: jashim, offerId: thirdOffer.offerId });
+    assert.strictEqual(accepted.joined, true);
+
+    const grown = await poolState(poolId);
+    assert.strictEqual(grown.members, 3, 'three passengers from one corner');
+    assert.strictEqual(grown.stops, 6);
+    assert.strictEqual(grown.capacity_snapshot, 3, 'and that is the car full');
+
+    const stops = (await stopsOf(poolId)).map((stop) => `${stop.stop_type}:${stop.service_point_code}`);
+
+    // All three are collected at the same corner before anybody is set down.
+    assert.deepStrictEqual(stops.slice(0, 3), [
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+    ]);
+
+    // The order the two circles are visited in is the router's business, so this
+    // asserts the set rather than a sequence that traffic could reorder.
+    assert.deepStrictEqual([...stops].sort(), [
+      'DROPOFF:gulshan-1-circle',
+      'DROPOFF:gulshan-1-circle',
+      'DROPOFF:gulshan-2-circle',
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+    ]);
+
+    const billed = await pool
+      .query(
+        `SELECT rr.accepted_fare::text AS solo_fare, a.final_fare::text AS pooled_fare
+           FROM passenger_fare_allocations a
+           JOIN ride_requests rr ON rr.id = a.ride_request_id
+           JOIN pool_fare_calculations c ON c.id = a.fare_calculation_id
+          WHERE c.ride_pool_id = $1::uuid AND c.status = 'CURRENT'`,
+        [poolId],
+      )
+      .then((result) => result.rows);
+
+    assert.strictEqual(billed.length, 3, 'all three passengers are billed');
+    for (const row of billed) {
+      assert.ok(Number(row.pooled_fare) <= Number(row.solo_fare));
+    }
+  });
+
+  it('shares a car between Banani Road 11 -> Gulshan 1 Circle and Banani Road 11 -> Mohakhali', async () => {
+    // The demo's headline share: two passengers waiting at the *same corner*,
+    // getting out at places either side of it. Under the redesigned rule that is
+    // exactly what makes it eligible --
+    //
+    //   * both start from Banani Road 11, and
+    //   * each destination is reachable from the other (the seed carries a direct
+    //     Gulshan 1 Circle <-> Mohakhali Bus Terminal edge), so the car can serve
+    //     one and then the other.
+    //
+    // No waiting, duration or detour limit is consulted, because that is the rule
+    // now: the shape of the two journeys decides, not how far apart they are.
+    const { poolId } = await createInitialPool({
+      driver: jashim,
+      passenger: nusrat,
+      origin: 'banani-road-11',
+      destination: 'gulshan-1-circle',
+    });
+
+    const rafiqRequest = await requestRide(rafiq, {
+      origin: 'banani-road-11',
+      destination: 'mohakhali-bus-terminal',
+    });
+
+    const offered = await assignment.assignWaitingRequest({ rideRequestId: rafiqRequest.id });
+    assert.strictEqual(offered.mode, 'POOL_JOIN');
+
+    const accepted = await offers.acceptOffer({ driver: jashim, offerId: offered.offerId });
+    assert.strictEqual(accepted.joined, true);
+
+    const grown = await poolState(poolId);
+    assert.strictEqual(grown.members, 2);
+    assert.strictEqual(grown.stops, 4);
+
+    const stops = (await stopsOf(poolId)).map((stop) => `${stop.stop_type}:${stop.service_point_code}`);
+
+    // Both are collected at the corner before either is set down.
+    assert.deepStrictEqual(stops.slice(0, 2), [
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+    ]);
+
+    // Which of the two destinations is served first is the router's business, so
+    // this asserts the set rather than an order traffic could reorder.
+    assert.deepStrictEqual([...stops].sort(), [
+      'DROPOFF:gulshan-1-circle',
+      'DROPOFF:mohakhali-bus-terminal',
+      'PICKUP:banani-road-11',
+      'PICKUP:banani-road-11',
+    ]);
+
+    // The passenger who rides further still never pays more than the solo quote
+    // they accepted. That is the guarantee that makes the detour acceptable.
+    const billed = await pool
+      .query(
+        `SELECT rr.accepted_fare::text AS solo_fare, a.final_fare::text AS pooled_fare
+           FROM passenger_fare_allocations a
+           JOIN ride_requests rr ON rr.id = a.ride_request_id
+           JOIN pool_fare_calculations c ON c.id = a.fare_calculation_id
+          WHERE c.ride_pool_id = $1::uuid AND c.status = 'CURRENT'`,
+        [poolId],
+      )
+      .then((result) => result.rows);
+
+    assert.strictEqual(billed.length, 2, 'both passengers are billed');
+    for (const row of billed) {
+      assert.ok(
+        Number(row.pooled_fare) <= Number(row.solo_fare),
+        `pooled fare ${row.pooled_fare} must not exceed the accepted solo fare ${row.solo_fare}`,
+      );
+    }
+  });
+
+  // Removed in the v2 redesign: there is no destination *prefilter* to assert
+  // against. A destination far from the pool no longer keeps the pool out of the
+  // shortlist -- the pool is considered and the insertion is what decides, by
+  // trying to route between the two drop-offs. The refusal case is the
+  // reachability one above; a destination that *is* reachable now joins.
 
   it('keeps the request WAITING through the whole refusal path, never MATCHED (category 53)', async () => {
     const { poolId } = await createInitialPool({ driver: jashim, passenger: nusrat });
