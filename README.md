@@ -848,14 +848,14 @@ cannot retroactively overfill a pool that was planned with the old number.
 
 **The database holds the rest:**
 
-| Guarantee | Enforced by |
-| --- | --- |
-| A ride request joins at most one pool | `pool_members.ride_request_id` `UNIQUE` |
-| A driver holds one offer at a time | `one_pending_offer_per_driver` (partial unique) |
-| A request is offered to one driver at a time | `one_pending_initial_offer_per_request` |
-| A driver has one active pool | `one_active_pool_per_driver` (partial unique) |
-| Capacity is a positive number | `ride_pools_capacity_positive` `CHECK` |
-| A lock wait cannot hang forever | `DISPATCH_TRANSACTION_TIMEOUT_MS` — 15 s |
+| Guarantee                                    | Enforced by                                       |
+| -------------------------------------------- | ------------------------------------------------- |
+| A ride request joins at most one pool        | `pool_members.ride_request_id` `UNIQUE`       |
+| A driver holds one offer at a time           | `one_pending_offer_per_driver` (partial unique) |
+| A request is offered to one driver at a time | `one_pending_initial_offer_per_request`         |
+| A driver has one active pool                 | `one_active_pool_per_driver` (partial unique)   |
+| Capacity is a positive number                | `ride_pools_capacity_positive` `CHECK`        |
+| A lock wait cannot hang forever              | `DISPATCH_TRANSACTION_TIMEOUT_MS` — 15 s       |
 
 A lock that cannot be taken in time therefore surfaces as a `409` carrying a sentence,
 not as a hung request. The loser sees an explanation; it does not see a spinner.
@@ -884,27 +884,22 @@ deployment here. It stops being the right tool once there is more than one write
 coordinate, or once the lock is held long enough to matter.
 
 1. **Optimistic concurrency instead of row locks.** `ride_pools` already carries a
-   `version` integer. A compare-and-swap — `UPDATE ride_pools SET version = version + 1
-   WHERE id = $1 AND version = $2` — lets the second writer *detect* the conflict and
+   `version` integer. A compare-and-swap — `UPDATE ride_pools SET version = version + 1 WHERE id = $1 AND version = $2` — lets the second writer *detect* the conflict and
    retry or refuse, rather than blocking. Blocking on a row for the length of a routing
    call is fine with one driver; at a thousand it is a queue, and a lock held across a
    network round trip is a lock held too long.
-
 2. **Reserve the seat at offer time, not at accept time.** Today the seat is taken only
    when the offer is accepted, so two passengers can both be told a seat exists before
    either holds it. A short-lived hold — a row with an `expires_at` — would make the
    offer itself the reservation. The offer's existing 30-second TTL is already the
    natural expiry, and the `sweeper` is already the reaper such a design needs.
-
 3. **Enforce capacity in the database.** A deferred constraint trigger counting members
    against `capacity_snapshot` would make the invariant hold no matter which code path
    writes — bringing the last rule in line with the rest.
-
 4. **Make acceptance idempotent by offer id.** Retrying an accept after a network
    failure should return the same pool, not fail. `dispatch_offers.id` is already a
    natural idempotency key; today `pool_members.ride_request_id UNIQUE` turns a duplicate
    into an error rather than into the original answer.
-
 5. **If writers ever span regions**, a single-primary row lock is no longer available,
    and the choice becomes serializable isolation or partitioning dispatch by city — so
    that every writer contending for one car is in the same place. Partitioning is
@@ -919,12 +914,12 @@ useful part is knowing *which* measurement, and in what order.
 
 ### The numbers that decide everything
 
-| | |
-| --- | --- |
-| Rides | ~2M/day if each passenger rides twice — **~23 rides/s average, ~100/s at peak** |
-| Writes per ride | ~10 (request, offer, accept, six trip commands, complete, settle) — **~1k writes/s peak** |
-| **Polling** | 100k online drivers × one offer read every 5 s — **20,000 req/s** |
-| …and each poll is **three sequential reads** | availability + offers + current-pool — **~60,000 req/s** |
+|                                                    |                                                                                             |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Rides                                              | ~2M/day if each passenger rides twice — **~23 rides/s average, ~100/s at peak**           |
+| Writes per ride                                    | ~10 (request, offer, accept, six trip commands, complete, settle) — **~1k writes/s peak** |
+| **Polling**                                  | 100k online drivers × one offer read every 5 s —**20,000 req/s**                    |
+| …and each poll is**three sequential reads** | availability + offers + current-pool —**~60,000 req/s**                              |
 
 That last row is the whole answer. **Matching is not the bottleneck; asking whether
 anything changed is.** Against ~100 rides/s of real work, ~60k req/s of clients
@@ -936,22 +931,22 @@ driver. At 100k it is 20,000 writes/s saying "this driver still exists".
 ### What breaks, in order
 
 1. **The heartbeat row.** One `UPDATE driver_profiles SET last_seen_at = now()` per
-driver per 5 s, each bumping `updated_at` through a trigger and generating WAL. The
-first change is not structural: a Redis TTL — `SET driver:alive:<id> EX 300` — expresses
-the same fact for nothing.
+   driver per 5 s, each bumping `updated_at` through a trigger and generating WAL. The
+   first change is not structural: a Redis TTL — `SET driver:alive:<id> EX 300` — expresses
+   the same fact for nothing.
 2. **Polling itself.** Replace both polls with push: offers push on creation, ride
-updates push on each `ride_events` append. The append-only timeline is already the event
-source, so this is a transport change rather than a redesign. A million concurrent
-connections needs a fan-out layer keyed by user id, and is sticky at the edge even
-though the API stays stateless.
+   updates push on each `ride_events` append. The append-only timeline is already the event
+   source, so this is a transport change rather than a redesign. A million concurrent
+   connections needs a fan-out layer keyed by user id, and is sticky at the edge even
+   though the API stays stateless.
 3. **Routing CPU.** Every request routes the passenger *and* routes each candidate for
-approach time: ~100 rides/s × up to 20 candidates is thousands of `pgr_dijkstra` calls a
-second, and pgRouting is CPU-bound per query. One of the two fixes is nearly free:
-journeys here are between *named service points*, so a route is a pure function of
-`(graph_version, origin, destination, rush_hour)` — a small, highly reusable key space.
-Precomputing that matrix is the largest CPU saving available.
+   approach time: ~100 rides/s × up to 20 candidates is thousands of `pgr_dijkstra` calls a
+   second, and pgRouting is CPU-bound per query. One of the two fixes is nearly free:
+   journeys here are between *named service points*, so a route is a pure function of
+   `(graph_version, origin, destination, rush_hour)` — a small, highly reusable key space.
+   Precomputing that matrix is the largest CPU saving available.
 4. **The liveness signal must survive the transport change.** Delete the poll naively and
-drivers stop being eligible after 300 s.
+   drivers stop being eligible after 300 s.
 
 ### The target shape
 
@@ -974,14 +969,14 @@ flowchart TB
 
     subgraph api["Stateless API pool"]
         direction TB
-        inst["Express instances &mdash; scale out freely<br/>a JWT in an HttpOnly cookie means<br/>there is no server session to replicate"]
+        inst["Express instances — scale out freely<br/>a JWT in an HttpOnly cookie means<br/>there is no server session to replicate"]
         limit["Rate limiting<br/>token bucket: auth, writes, offers"]
     end
 
     subgraph workers["Workers"]
         direction TB
-        matcher["Matcher &mdash; geo-sharded by city<br/>the only CPU-bound tier: routing<br/>the one plausible extraction"]
-        sweeper["Sweeper &mdash; leader-elected<br/>expiry, re-offer, retry"]
+        matcher["Matcher — geo-sharded by city<br/>the only CPU-bound tier: routing<br/>the one plausible extraction"]
+        sweeper["Sweeper — leader-elected<br/>expiry, re-offer, retry"]
         fan["Notifications, analytics<br/>fan-out only, never on the critical path"]
     end
 
@@ -995,8 +990,8 @@ flowchart TB
 
     subgraph pg["PostgreSQL"]
         direction TB
-        primary["Primary &mdash; all writes, and every read<br/>you are about to act on"]
-        replicas["Read replicas &mdash; history, timelines,<br/>reference data. Never a pending offer."]
+        primary["Primary — all writes, and every read<br/>you are about to act on"]
+        replicas["Read replicas — history, timelines,<br/>reference data. Never a pending offer."]
         partitions["Partitioned by month:<br/>ride_events, pool_events, wallet_ledger"]
     end
 
@@ -1164,12 +1159,12 @@ still fits.
 
 ### Staged
 
-| Stage | Scale | Change |
-| --- | --- | --- |
-| 0 | today | Synchronous dispatch, 5 s polling, one primary |
-| 1 | 10k drivers | Push instead of poll; GiST and hot-path indexes; PgBouncer; ledger partitioned; heartbeat to Redis |
-| 2 | 100k drivers | Geo-shard dispatch by city; Redis GEO for location; async matching with a delayed queue; route cache; leader-elected sweeper; extract the matcher |
-| 3 | 1M+ | Multi-region, partitioned by city, with no cross-region coordination |
+| Stage | Scale        | Change                                                                                                                                            |
+| ----- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0     | today        | Synchronous dispatch, 5 s polling, one primary                                                                                                    |
+| 1     | 10k drivers  | Push instead of poll; GiST and hot-path indexes; PgBouncer; ledger partitioned; heartbeat to Redis                                                |
+| 2     | 100k drivers | Geo-shard dispatch by city; Redis GEO for location; async matching with a delayed queue; route cache; leader-elected sweeper; extract the matcher |
+| 3     | 1M+          | Multi-region, partitioned by city, with no cross-region coordination                                                                              |
 
 **In one line:** this design's scaling story is not "make matching faster". It is "stop
 asking 100,000 phones whether anything has changed". Everything after that is ordinary
@@ -1232,4 +1227,4 @@ Lets be honest about this section. So , when I first saw the PRD, I had spent al
 
 ## Demo video
 
-_TODO — add the link._
+[drive.google.com/file/d/1GALBd9rBK3cbUBfWJ4Tq8NalDWFtg7Le/view?usp=sharing](https://drive.google.com/file/d/1GALBd9rBK3cbUBfWJ4Tq8NalDWFtg7Le/view?usp=sharing)
