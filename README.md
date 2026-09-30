@@ -1225,6 +1225,6 @@ work.
 
 Lets be honest about this section. So , when I first saw the PRD, I had spent aleast 2-3 hours for breaking and thinking down the problem into small sub problems with pen and paper. Thats included user perpective, the share pool problem, how the full workflow should be organized. Then I organized the possible API patterns, like how will be the request schema, how will the response come out. After doing these self analysis, I made a end to end LLM prompt having my prepared intuition and feature requirement.I asked for a complete plan. Then I had carefully gone through all of those plan. After getting those steps , I made my implementation flow. Like , map building -> user auth -> ride request and so on. Then I start building each of segments. I started with map building. The initial idea about creating map feature that LLM gave me was a hard coded pre-defined json file with some location seeded inside. But what changed that to gepspatial search that I read earliar. After planning I let AI do the rest of the work including coding and testing.Then I move to other feature part like auth, ride-request service. The commit history tells rest of the story. One important thing I want to say is I DIDNT WRITE ANY SINGLE LINE OF CODE for this project. what I did is reasoning,planning, testing and debugging.
 
-## Demo video
+## Demo  video
 
 [drive.google.com/file/d/1GALBd9rBK3cbUBfWJ4Tq8NalDWFtg7Le/view?usp=sharing](https://drive.google.com/file/d/1GALBd9rBK3cbUBfWJ4Tq8NalDWFtg7Le/view?usp=sharing)
